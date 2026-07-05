@@ -30,6 +30,7 @@ REPORT_TEMPLATE = Template(
     img { max-width: 100%; border-radius: 8px; margin: 16px 0; border: 1px solid #e2e8f0; }
     a { color: #2563eb; text-decoration: none; }
     .note { background: #fff7ed; border-left: 4px solid #f59e0b; padding: 12px 16px; margin: 20px 0; }
+    .note-inline { color: #b45309; }
     .all-listings { font-size: 14px; }
     .all-listings td, .all-listings th { padding: 8px; }
   </style>
@@ -43,6 +44,9 @@ REPORT_TEMPLATE = Template(
       Источник данных: <strong>{{ source }}</strong><br>
       Всего найдено на Авито: <strong>{{ total_found }}</strong>,
       собрано в отчёт: <strong>{{ total_listings }}</strong>
+      {% if total_found > total_listings %}
+      <br><span class="note-inline">Собраны не все объявления. Увеличьте MAX_PAGES в .env или запустите повторно.</span>
+      {% endif %}
     </p>
 
     {% if demo_notice %}
