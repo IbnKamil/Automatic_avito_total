@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import random
@@ -7,7 +8,7 @@ import re
 import time
 from datetime import datetime, timedelta
 from typing import Any
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -38,6 +39,15 @@ class AvitoScraperError(Exception):
 
 class AvitoBlockedError(AvitoScraperError):
     pass
+
+
+def build_listing_url(url_path: str | None, avito_id: int, region_slug: str) -> str:
+    if url_path:
+        path = url_path.split("?", 1)[0]
+        if not path.startswith("/"):
+            path = f"/{path}"
+        return urljoin(AVITO_BASE, path)
+    return f"{AVITO_BASE}/{region_slug}?q={avito_id}"
 
 
 def resolve_location_id(region_name: str) -> tuple[str, int]:
@@ -94,7 +104,46 @@ def _parse_price(value: Any) -> tuple[int | None, str]:
     return None, "Цена не указана"
 
 
-def _item_from_api_payload(item: dict[str, Any]) -> Listing | None:
+def _matches_product(title: str, product: str) -> bool:
+    title_lower = title.lower()
+    product_lower = product.lower().strip()
+    if not product_lower:
+        return True
+    if product_lower in title_lower:
+        return True
+    stems = [product_lower[: max(4, len(product_lower) - 2)], product_lower.rstrip("и")]
+    return any(stem and stem in title_lower for stem in stems)
+
+
+def _matches_region(
+    listing: Listing, region_slug: str, location_id: int, region_name: str
+) -> bool:
+    location_lower = listing.location.lower()
+    region_name_lower = region_name.lower()
+    if region_name_lower in location_lower or "дагестан" in location_lower:
+        return True
+    url_path = urlparse(listing.url).path.lower()
+    if f"/{region_slug.lower()}/" in url_path:
+        return True
+    raw_location_id = listing.raw.get("locationId")
+    if raw_location_id and int(raw_location_id) == location_id:
+        return True
+    foreign_markers = (
+        "москва",
+        "санкт-петербург",
+        "спб",
+        "краснодар",
+        "новосибирск",
+        "екатеринбург",
+        "саратов",
+        "ростов",
+    )
+    if any(marker in location_lower for marker in foreign_markers):
+        return False
+    return True
+
+
+def _item_from_api_payload(item: dict[str, Any], config: AppConfig) -> Listing | None:
     avito_id = item.get("id")
     if not avito_id:
         return None
@@ -109,11 +158,7 @@ def _item_from_api_payload(item: dict[str, Any]) -> Listing | None:
         or item.get("address")
         or ""
     )
-    url_path = item.get("urlPath") or item.get("url") or ""
-    if url_path and not url_path.startswith("http"):
-        url = urljoin(AVITO_BASE, url_path)
-    else:
-        url = url_path or f"{AVITO_BASE}/item/{avito_id}"
+    url = build_listing_url(item.get("urlPath") or item.get("url"), int(avito_id), config.region_slug)
     images = item.get("images") or []
     image_url = ""
     if images:
@@ -143,7 +188,7 @@ def _item_from_api_payload(item: dict[str, Any]) -> Listing | None:
     )
 
 
-def _parse_html_listings(html: str) -> list[Listing]:
+def _parse_html_listings(html: str, config: AppConfig) -> list[Listing]:
     soup = BeautifulSoup(html, "lxml")
     listings: list[Listing] = []
     cards = soup.select('[data-marker="item"]')
@@ -154,13 +199,21 @@ def _parse_html_listings(html: str) -> list[Listing]:
         if not link:
             continue
         href = link.get("href", "")
-        url = urljoin(AVITO_BASE, href)
-        match = re.search(r"_(\d+)$|/(\d+)$", href)
-        avito_id = int(match.group(1) or match.group(2)) if match else hash(url) % 10**12
+        if not href:
+            continue
+        url = urljoin(AVITO_BASE, href.split("?", 1)[0])
+        match = re.search(r"_(\d{6,})$", href)
+        if not match:
+            match = re.search(r"/(\d{6,})(?:\?|$)", href)
+        if not match:
+            continue
+        avito_id = int(match.group(1))
         title_el = card.select_one('[data-marker="item-title"]') or link
         title = title_el.get_text(" ", strip=True)
         price_el = card.select_one('[data-marker="item-price"]')
-        price, price_string = _parse_price(price_el.get_text(" ", strip=True) if price_el else None)
+        price, price_string = _parse_price(
+            price_el.get_text(" ", strip=True) if price_el else None
+        )
         location_el = card.select_one('[data-marker="item-address"]') or card.select_one(
             '[data-marker="item-location"]'
         )
@@ -182,7 +235,41 @@ def _parse_html_listings(html: str) -> list[Listing]:
     return listings
 
 
-def _generate_demo_listings(product: str, region: str) -> list[Listing]:
+def _parse_json_items_from_html(html: str, config: AppConfig) -> list[Listing]:
+    listings: list[Listing] = []
+    seen: set[int] = set()
+    pattern = re.compile(
+        r'"id"\s*:\s*(\d{6,})\s*,\s*'
+        r'(?:"urlPath"\s*:\s*"(?P<urlPath>[^"]+)"\s*,\s*)?'
+        r'"title"\s*:\s*"(?P<title>(?:\\.|[^"\\])*)"',
+        re.DOTALL,
+    )
+    for match in pattern.finditer(html):
+        avito_id = int(match.group(1))
+        if avito_id in seen:
+            continue
+        title = json.loads(f'"{match.group("title")}"')
+        url_path = match.group("urlPath")
+        if not url_path:
+            continue
+        seen.add(avito_id)
+        listings.append(
+            Listing(
+                avito_id=avito_id,
+                title=title.strip(),
+                price=None,
+                price_string="Цена не указана",
+                url=build_listing_url(url_path, avito_id, config.region_slug),
+                location="",
+                city="Не указан",
+                image_url="",
+                raw={"urlPath": url_path},
+            )
+        )
+    return listings
+
+
+def _generate_demo_listings(product: str, region: str, region_slug: str) -> list[Listing]:
     cities = [
         "Махачкала",
         "Дербент",
@@ -195,18 +282,17 @@ def _generate_demo_listings(product: str, region: str) -> list[Listing]:
     listings: list[Listing] = []
     base_prices = [3500, 5200, 7800, 12000, 15500, 22000, 28000, 45000]
     now = datetime.utcnow()
-    for index in range(42):
+    for index in range(10):
         city = cities[index % len(cities)]
         material = materials[index % len(materials)]
         price = base_prices[index % len(base_prices)] + (index % 7) * 500
-        avito_id = 8200000000 + index
         listings.append(
             Listing(
-                avito_id=avito_id,
-                title=f"{product} {material}, {region}, {city}",
+                avito_id=0,
+                title=f"[ДЕМО] {product} {material}, {region}, {city}",
                 price=price,
                 price_string=f"{price:,}".replace(",", " ") + " ₽",
-                url=f"{AVITO_BASE}/dagestan/mebel_i_interer/{product.lower()}_{avito_id}",
+                url="",
                 location=f"Республика {region}, {city}",
                 city=city,
                 image_url="",
@@ -230,6 +316,12 @@ class AvitoScraper:
         if config.proxy:
             self.session.proxies.update({"http": config.proxy, "https": config.proxy})
 
+    def _search_referer(self, page: int = 1) -> str:
+        params = f"q={quote(self.config.product)}"
+        if page > 1:
+            params += f"&p={page}"
+        return f"{AVITO_BASE}/{self.config.region_slug}?{params}"
+
     def _is_blocked(self, payload: Any) -> bool:
         if isinstance(payload, dict) and "too-many-requests" in payload:
             return True
@@ -238,24 +330,59 @@ class AvitoScraper:
             return "captcha" in lowered or "ограничен" in lowered
         return False
 
-    def _warmup(self) -> None:
-        search_url = (
-            f"{AVITO_BASE}/{self.config.region_slug}"
-            f"?q={quote(self.config.product)}"
+    def _accept_listing(self, listing: Listing) -> bool:
+        if not _matches_product(listing.title, self.config.product):
+            return False
+        return _matches_region(
+            listing,
+            self.config.region_slug,
+            self.config.location_id,
+            self.config.region,
         )
-        self.session.get(search_url, timeout=30)
+
+    def _add_listing(
+        self,
+        listing: Listing | None,
+        listings: list[Listing],
+        seen_ids: set[int],
+    ) -> bool:
+        if not listing or listing.avito_id in seen_ids:
+            return False
+        if not self._accept_listing(listing):
+            return False
+        seen_ids.add(listing.avito_id)
+        listings.append(listing)
+        return True
+
+    def _fetch_html_page(self, page: int) -> str:
+        params = {"q": self.config.product}
+        if page > 1:
+            params["p"] = page
+        response = self.session.get(
+            f"{AVITO_BASE}/{self.config.region_slug}",
+            params=params,
+            headers={"Referer": self._search_referer(page)},
+            timeout=30,
+        )
+        if response.status_code in {403, 429}:
+            raise AvitoBlockedError(response.text)
+        response.raise_for_status()
+        if self._is_blocked(response.text):
+            raise AvitoBlockedError("HTML-страница заблокирована")
+        return response.text
 
     def _fetch_api_page(self, page: int) -> dict[str, Any]:
         params = {
             "query": self.config.product,
             "locationId": self.config.location_id,
+            "localPriority": 1,
             "page": page,
             "limit": 50,
         }
         response = self.session.get(
             ITEMS_API,
             params=params,
-            headers={"Referer": f"{AVITO_BASE}/{self.config.region_slug}"},
+            headers={"Referer": self._search_referer(page)},
             timeout=30,
         )
         if response.status_code in {403, 429}:
@@ -266,22 +393,71 @@ class AvitoScraper:
             raise AvitoBlockedError(json.dumps(data, ensure_ascii=False))
         return data
 
-    def _fetch_html_page(self, page: int) -> str:
-        params = {"q": self.config.product}
-        if page > 1:
-            params["p"] = page
-        url = f"{AVITO_BASE}/{self.config.region_slug}"
-        response = self.session.get(url, params=params, timeout=30)
-        if response.status_code in {403, 429}:
-            raise AvitoBlockedError(response.text)
-        response.raise_for_status()
-        if self._is_blocked(response.text):
-            raise AvitoBlockedError("HTML-страница заблокирована")
-        return response.text
+    def _scan_html(self) -> tuple[list[Listing], int, int]:
+        listings: list[Listing] = []
+        seen_ids: set[int] = set()
+        total_found = 0
+        pages_scanned = 0
+
+        for page in range(1, self.config.max_pages + 1):
+            html = self._fetch_html_page(page)
+            page_listings = _parse_html_listings(html, self.config)
+            if not page_listings:
+                page_listings = _parse_json_items_from_html(html, self.config)
+
+            if not page_listings:
+                break
+
+            added = 0
+            for listing in page_listings:
+                if self._add_listing(listing, listings, seen_ids):
+                    added += 1
+
+            pages_scanned += 1
+            total_found = max(total_found, len(listings))
+            if added == 0:
+                break
+            if len(page_listings) < 30:
+                break
+            time.sleep(self.config.request_delay_seconds)
+
+        return listings, total_found, pages_scanned
+
+    def _scan_api(self) -> tuple[list[Listing], int, int]:
+        listings: list[Listing] = []
+        seen_ids: set[int] = set()
+        total_found = 0
+        pages_scanned = 0
+
+        self.session.get(self._search_referer(1), timeout=30)
+        time.sleep(self.config.request_delay_seconds)
+
+        for page in range(1, self.config.max_pages + 1):
+            payload = self._fetch_api_page(page)
+            total_found = int(payload.get("totalCount") or payload.get("count") or total_found)
+            page_items = payload.get("items") or []
+            if not page_items:
+                break
+
+            added = 0
+            for item in page_items:
+                if self._add_listing(_item_from_api_payload(item, self.config), listings, seen_ids):
+                    added += 1
+
+            pages_scanned += 1
+            if added == 0:
+                break
+            if len(page_items) < 50:
+                break
+            time.sleep(self.config.request_delay_seconds)
+
+        return listings, total_found or len(listings), pages_scanned
 
     def scan(self) -> ScanResult:
         if self.config.demo_mode:
-            listings = _generate_demo_listings(self.config.product, self.config.region)
+            listings = _generate_demo_listings(
+                self.config.product, self.config.region, self.config.region_slug
+            )
             return ScanResult(
                 scan_id=0,
                 scanned_at=datetime.utcnow(),
@@ -293,62 +469,28 @@ class AvitoScraper:
                 source="demo",
             )
 
-        self._warmup()
-        time.sleep(self.config.request_delay_seconds)
-
         listings: list[Listing] = []
-        seen_ids: set[int] = set()
         total_found = 0
         pages_scanned = 0
-        source = "api"
+        source = "html"
 
         try:
-            for page in range(1, self.config.max_pages + 1):
-                try:
-                    payload = self._fetch_api_page(page)
-                except AvitoBlockedError:
-                    if listings:
-                        break
-                    source = "html"
-                    html = self._fetch_html_page(page)
-                    page_listings = _parse_html_listings(html)
-                    if not page_listings:
-                        raise
-                    for listing in page_listings:
-                        if listing.avito_id not in seen_ids:
-                            seen_ids.add(listing.avito_id)
-                            listings.append(listing)
-                    pages_scanned += 1
-                    break
-
-                total_found = int(payload.get("totalCount") or payload.get("count") or 0)
-                page_items = payload.get("items") or []
-                if not page_items:
-                    break
-                for item in page_items:
-                    listing = _item_from_api_payload(item)
-                    if listing and listing.avito_id not in seen_ids:
-                        seen_ids.add(listing.avito_id)
-                        listings.append(listing)
-                pages_scanned += 1
-                if len(page_items) < 50:
-                    break
-                time.sleep(self.config.request_delay_seconds)
-        except AvitoBlockedError as exc:
+            listings, total_found, pages_scanned = self._scan_html()
             if not listings:
-                logger.warning(
-                    "Авито заблокировал запросы (%s). Используются демо-данные для отчёта.",
-                    exc,
-                )
-                listings = _generate_demo_listings(self.config.product, self.config.region)
-                source = "demo-fallback"
-                total_found = len(listings)
-                pages_scanned = 1
-            else:
-                logger.warning("Сканирование прервано из-за блокировки после %s страниц", pages_scanned)
+                source = "api"
+                listings, total_found, pages_scanned = self._scan_api()
+        except AvitoBlockedError as exc:
+            raise AvitoScraperError(
+                "Авито заблокировал запросы. Запустите программу с российского IP "
+                "или укажите PROXY в .env. Для теста без Авито используйте: "
+                "python -m avito_monitor scan --demo --no-email"
+            ) from exc
 
         if not listings:
-            raise AvitoScraperError("Не удалось получить объявления с Авито")
+            raise AvitoScraperError(
+                f"Не найдено объявлений по запросу «{self.config.product}» "
+                f"в регионе «{self.config.region}». Проверьте PRODUCT, REGION и LOCATION_ID."
+            )
 
         return ScanResult(
             scan_id=0,
@@ -360,3 +502,28 @@ class AvitoScraper:
             pages_scanned=pages_scanned,
             source=source,
         )
+
+
+def export_listings_csv(listings: list[Listing], path: str) -> None:
+    rows = sorted(
+        listings,
+        key=lambda item: (item.price is None, item.price or 0, item.title),
+    )
+    with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["avito_id", "title", "price", "price_string", "city", "location", "url"],
+        )
+        writer.writeheader()
+        for listing in rows:
+            writer.writerow(
+                {
+                    "avito_id": listing.avito_id,
+                    "title": listing.title,
+                    "price": listing.price if listing.price is not None else "",
+                    "price_string": listing.price_string,
+                    "city": listing.city,
+                    "location": listing.location,
+                    "url": listing.url,
+                }
+            )

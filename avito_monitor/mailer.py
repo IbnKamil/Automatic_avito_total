@@ -5,9 +5,11 @@ import logging
 import mimetypes
 import smtplib
 import ssl
+from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email import encoders
 from pathlib import Path
 
 from avito_monitor.config import AppConfig
@@ -58,7 +60,7 @@ class EmailSender:
         subject: str,
         html_body: str,
         embedded_charts: list[dict[str, str]],
-        attachment_path: Path | None = None,
+        attachment_paths: list[Path] | None = None,
     ) -> None:
         if not self.is_configured():
             raise EmailConfigurationError(
@@ -82,11 +84,19 @@ class EmailSender:
             )
             message.attach(image)
 
-        if attachment_path and attachment_path.exists():
+        for attachment_path in attachment_paths or []:
+            if not attachment_path.exists():
+                continue
             mime_type, _ = mimetypes.guess_type(attachment_path.name)
-            _, subtype = (mime_type or "text/html").split("/", 1)
+            maintype, subtype = (mime_type or "application/octet-stream").split("/", 1)
             with attachment_path.open("rb") as handle:
-                attachment = MIMEText(handle.read().decode("utf-8"), _subtype=subtype)
+                payload = handle.read()
+            if maintype == "text":
+                attachment = MIMEText(payload.decode("utf-8"), _subtype=subtype, _charset="utf-8")
+            else:
+                attachment = MIMEBase(maintype, subtype)
+                attachment.set_payload(payload)
+                encoders.encode_base64(attachment)
             attachment.add_header(
                 "Content-Disposition",
                 "attachment",

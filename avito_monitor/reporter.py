@@ -30,6 +30,8 @@ REPORT_TEMPLATE = Template(
     img { max-width: 100%; border-radius: 8px; margin: 16px 0; border: 1px solid #e2e8f0; }
     a { color: #2563eb; text-decoration: none; }
     .note { background: #fff7ed; border-left: 4px solid #f59e0b; padding: 12px 16px; margin: 20px 0; }
+    .all-listings { font-size: 14px; }
+    .all-listings td, .all-listings th { padding: 8px; }
   </style>
 </head>
 <body>
@@ -86,6 +88,35 @@ REPORT_TEMPLATE = Template(
         <td>{{ item.city }}</td>
         <td>{{ format_price(item.price) }}</td>
         <td><a href="{{ item.url }}">Открыть</a></td>
+      </tr>
+      {% endfor %}
+    </table>
+
+    <h2>Все объявления ({{ all_listings|length }})</h2>
+    <p>Полный список собранных объявлений со ссылками на Авито. Также приложен файл <strong>listings.csv</strong>.</p>
+    <table class="all-listings">
+      <tr>
+        <th>#</th>
+        <th>Название</th>
+        <th>Город</th>
+        <th>Цена</th>
+        <th>ID</th>
+        <th>Ссылка</th>
+      </tr>
+      {% for item in all_listings %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td>{{ item.title }}</td>
+        <td>{{ item.city }}</td>
+        <td>{{ item.price_display }}</td>
+        <td>{{ item.avito_id or '—' }}</td>
+        <td>
+          {% if item.url %}
+          <a href="{{ item.url }}">Открыть на Авито</a>
+          {% else %}
+          —
+          {% endif %}
+        </td>
       </tr>
       {% endfor %}
     </table>
@@ -179,9 +210,26 @@ class ReportBuilder:
         demo_notice = ""
         if scan.source.startswith("demo"):
             demo_notice = (
-                "Данные получены в демо-режиме или через fallback из-за ограничений доступа к Авито. "
-                "Для реального мониторинга запускайте программу с российского IP или через прокси (PROXY)."
+                "Внимание: это демо-отчёт. Ссылки на Авито отсутствуют, данные вымышленные. "
+                "Для реального мониторинга запускайте без флага --demo: "
+                "python -m avito_monitor scan"
             )
+
+        all_listings = [
+            {
+                "avito_id": listing.avito_id,
+                "title": listing.title,
+                "city": listing.city,
+                "price_display": listing.price_string
+                if listing.price_string
+                else _format_price(listing.price),
+                "url": listing.url,
+            }
+            for listing in sorted(
+                scan.listings,
+                key=lambda item: (item.price is None, item.price or 0, item.title.lower()),
+            )
+        ]
 
         chart_blocks = [
             {"title": CHART_TITLES.get(key, key), "cid": key, "path": path}
@@ -203,6 +251,7 @@ class ReportBuilder:
             percentiles=stats.price_percentiles,
             top_cheapest=stats.top_cheapest,
             top_expensive=stats.top_expensive,
+            all_listings=all_listings,
             charts=[{"title": c["title"], "cid": c["cid"]} for c in chart_blocks],
             insights=_build_insights(stats, scan),
             demo_notice=demo_notice,
@@ -216,6 +265,7 @@ class ReportBuilder:
         scan: ScanResult,
         html: str,
         chart_paths: dict[str, Path],
+        csv_path: Path | None = None,
     ) -> Path:
         timestamp = scan.scanned_at.strftime("%Y%m%d_%H%M%S")
         report_dir = reports_dir / f"report_{timestamp}"
@@ -223,9 +273,13 @@ class ReportBuilder:
         html_path = report_dir / "report.html"
         html_path.write_text(html, encoding="utf-8")
 
-        for key, source in chart_paths.items():
+        for source in chart_paths.values():
             target = report_dir / source.name
             target.write_bytes(source.read_bytes())
+
+        if csv_path and csv_path.exists():
+            target_csv = report_dir / "listings.csv"
+            target_csv.write_bytes(csv_path.read_bytes())
 
         return html_path
 
