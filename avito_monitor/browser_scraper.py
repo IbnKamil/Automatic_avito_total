@@ -135,6 +135,15 @@ class BrowserScraper:
             )
             context.add_init_script(_STEALTH_SCRIPT)
             page = context.pages[0] if context.pages else context.new_page()
+            if not headless:
+                logger.info(
+                    "Открыто окно Chrome. Если появится капча — пройдите её, "
+                    "затем программа сама начнёт сканирование и листание страниц."
+                )
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
             api_payloads: list[dict[str, Any]] = []
 
             def on_response(response) -> None:
@@ -164,6 +173,10 @@ class BrowserScraper:
 
                 html = self._load_page(page, url, warmed_up=warmed_up)
                 warmed_up = True
+
+                if not headless and page_num == 1 and self._item_count(page) == 0:
+                    self._wait_for_listings(page, headless=False)
+                    html = page.content()
 
                 if _is_browser_page_blocked(html):
                     blocked = True

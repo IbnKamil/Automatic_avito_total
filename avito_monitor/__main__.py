@@ -29,7 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
     scan_parser.add_argument(
         "--visible-browser",
         action="store_true",
-        help="Открыть видимое окно браузера (для прохождения капчи)",
+        help="Открыть видимое окно браузера (включено по умолчанию)",
+    )
+    scan_parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Скрытый браузер без окна (может не пройти капчу Авито)",
     )
     scan_parser.add_argument(
         "--no-pdf",
@@ -79,6 +84,9 @@ def main(argv: list[str] | None = None) -> int:
         config.use_browser = True
     if getattr(args, "visible_browser", False):
         config.browser_headless = False
+        config.use_browser = True
+    if getattr(args, "headless", False):
+        config.browser_headless = True
         config.use_browser = True
     if getattr(args, "no_pdf", False):
         config.export_pdf = False

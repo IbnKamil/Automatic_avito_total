@@ -30,7 +30,7 @@ class AppConfig:
     demo_mode: bool = False
     use_browser: bool = True
     browser_only: bool = False
-    browser_headless: bool = True
+    browser_headless: bool = False
     browser_profile_dir: str = "data/browser_profile"
     export_pdf: bool = True
     browser_max_empty_pages: int = 3
