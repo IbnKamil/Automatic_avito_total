@@ -57,7 +57,7 @@ class MonitorService:
                 embedded = ReportBuilder.embed_charts_for_email(chart_blocks)
                 self.mailer.send_report(
                     subject,
-                    html,
+                    ReportBuilder.html_for_email(html, chart_blocks),
                     embedded,
                     attachment_paths=[report_path, csv_path],
                 )

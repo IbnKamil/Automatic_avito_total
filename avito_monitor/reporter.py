@@ -125,9 +125,9 @@ REPORT_TEMPLATE = Template(
       {% endfor %}
     </table>
 
-  {% for title, chart in charts %}
-    <h2>{{ title }}</h2>
-    <img src="cid:{{ chart.cid }}" alt="{{ title }}">
+  {% for chart in charts %}
+    <h2>{{ chart.title }}</h2>
+    <img src="{{ chart.src }}" alt="{{ chart.title }}">
   {% endfor %}
 
     <h2>Выводы</h2>
@@ -236,7 +236,12 @@ class ReportBuilder:
         ]
 
         chart_blocks = [
-            {"title": CHART_TITLES.get(key, key), "cid": key, "path": path}
+            {
+                "title": CHART_TITLES.get(key, key),
+                "cid": key,
+                "path": path,
+                "filename": path.name,
+            }
             for key, path in chart_paths.items()
         ]
 
@@ -256,12 +261,25 @@ class ReportBuilder:
             top_cheapest=stats.top_cheapest,
             top_expensive=stats.top_expensive,
             all_listings=all_listings,
-            charts=[{"title": c["title"], "cid": c["cid"]} for c in chart_blocks],
+            charts=[
+                {"title": block["title"], "cid": block["cid"], "src": block["filename"]}
+                for block in chart_blocks
+            ],
             insights=_build_insights(stats, scan),
             demo_notice=demo_notice,
             format_price=_format_price,
         )
         return html, chart_blocks
+
+    @staticmethod
+    def html_for_email(html: str, chart_blocks: list[dict[str, Any]]) -> str:
+        email_html = html
+        for block in chart_blocks:
+            email_html = email_html.replace(
+                f'src="{block["filename"]}"',
+                f'src="cid:{block["cid"]}"',
+            )
+        return email_html
 
     def save_report(
         self,
