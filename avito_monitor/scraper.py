@@ -671,12 +671,16 @@ class AvitoScraper:
 
     def _request_with_retry(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         last_error: Exception | None = None
-        backoff = self.config.rate_limit_backoff_seconds
-        for attempt in range(3):
+        fast_fail = self.config.use_browser or self.config.browser_only
+        max_attempts = 1 if fast_fail else 3
+        backoff = 0.0 if fast_fail else self.config.rate_limit_backoff_seconds
+        for attempt in range(max_attempts):
             response = self.session.request(method, url, **kwargs)
             if response.status_code not in {429, 503}:
                 return response
             last_error = AvitoBlockedError(response.text)
+            if attempt + 1 >= max_attempts:
+                break
             wait_seconds = backoff * (attempt + 1)
             logger.warning(
                 "Авито вернул %s, повтор через %s сек.",
@@ -995,6 +999,32 @@ class AvitoScraper:
 
         return listings, total_found or len(listings), pages_scanned, source
 
+    def _try_browser_scan(
+        self,
+    ) -> tuple[list[Listing], int, int, str] | None:
+        logger.info("Запуск браузерного сканирования Playwright...")
+        try:
+            from avito_monitor.browser_scraper import BrowserScraper
+
+            browser_listings, browser_total, browser_pages = BrowserScraper(
+                self.config, self._search_url
+            ).scan()
+            if browser_listings:
+                logger.info(
+                    "Браузер: собрано %s из %s объявлений",
+                    len(browser_listings),
+                    browser_total,
+                )
+                return browser_listings, browser_total, browser_pages, "browser"
+            logger.warning("Браузер: релевантные объявления не найдены")
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            if self.config.browser_only:
+                raise AvitoScraperError(str(exc)) from exc
+        except Exception as exc:
+            logger.warning("Браузерное сканирование не удалось: %s", exc)
+        return None
+
     def scan(self) -> ScanResult:
         if self.config.demo_mode:
             listings = _generate_demo_listings(
@@ -1017,6 +1047,32 @@ class AvitoScraper:
         source = "html"
         last_block_error: AvitoBlockedError | None = None
 
+        if self.config.use_browser or self.config.browser_only:
+            browser_result = self._try_browser_scan()
+            if browser_result:
+                listings, total_found, pages_scanned, source = browser_result
+                return ScanResult(
+                    scan_id=0,
+                    scanned_at=datetime.utcnow(),
+                    product=self.config.product,
+                    region=self.config.region,
+                    listings=listings,
+                    total_found=total_found or len(listings),
+                    pages_scanned=pages_scanned,
+                    source=source,
+                )
+            if self.config.browser_only or self.config.use_browser:
+                raise AvitoScraperError(
+                    f"Браузерное сканирование не дало результатов для «{self.config.product}» "
+                    f"в регионе «{self.config.region}». "
+                    f"Возможна блокировка IP или капча на Авито.\n"
+                    f"Установите Playwright:\n"
+                    f"  pip install playwright\n"
+                    f"  python -m playwright install chromium\n"
+                    f"Попробуйте позже, смените интернет или укажите PROXY в .env.\n"
+                    f"Проверка в браузере: {self._search_url(1)}"
+                )
+
         try:
             listings, total_found, pages_scanned, source = self._scan_catalog()
         except AvitoBlockedError as exc:
@@ -1029,42 +1085,24 @@ class AvitoScraper:
                 total_found or len(listings),
                 source,
             )
-        elif self.config.use_browser:
-            logger.info("HTTP-сканирование не дало результатов, запускаю браузер Playwright...")
-            try:
-                from avito_monitor.browser_scraper import BrowserScraper
-
-                browser_listings, browser_total, browser_pages = BrowserScraper(
-                    self.config, self._search_url
-                ).scan()
-                if browser_listings:
-                    listings = browser_listings
-                    total_found = browser_total
-                    pages_scanned = browser_pages
-                    source = "browser"
-                    logger.info(
-                        "Браузер: собрано %s из %s объявлений",
-                        len(listings),
-                        total_found,
-                    )
-            except RuntimeError as exc:
-                logger.error("%s", exc)
-            except Exception as exc:
-                logger.warning("Браузерное сканирование не удалось: %s", exc)
         elif last_block_error and not listings:
             raise AvitoScraperError(
                 "Авито заблокировал запросы. Попробуйте позже, запустите с другого интернета "
-                "или укажите PROXY в .env. Для теста отчёта без Авито: "
-                "python -m avito_monitor scan --demo --no-email"
+                "или укажите PROXY в .env. Для обхода блокировки включите браузерный режим:\n"
+                "  USE_BROWSER=true\n"
+                "  pip install playwright\n"
+                "  python -m playwright install chromium\n"
+                "Для теста отчёта без Авито: python -m avito_monitor scan --demo --no-email"
             ) from last_block_error
 
         if not listings:
             raise AvitoScraperError(
                 f"Не найдено объявлений «{self.config.product}» в регионе «{self.config.region}». "
-                f"Авито ограничивает частые запросы (429). Установите браузерный режим:\n"
+                f"Авито ограничивает частые запросы (429). Включите браузерный режим:\n"
+                f"  USE_BROWSER=true\n"
                 f"  pip install playwright\n"
-                f"  playwright install chromium\n"
-                f"И убедитесь, что USE_BROWSER=true в .env\n"
+                f"  python -m playwright install chromium\n"
+                f"Или запустите: python -m avito_monitor scan --browser-only --no-email\n"
                 f"Проверка в браузере: {self._search_url(1)}"
             )
 

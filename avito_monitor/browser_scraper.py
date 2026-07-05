@@ -19,6 +19,19 @@ from avito_monitor.scraper import (
 
 logger = logging.getLogger(__name__)
 
+_BLOCK_MARKERS = (
+    "доступ с вашего ip-адреса временно ограничен",
+    "firewall/captcha",
+    "подтвердите, что вы не робот",
+    "checkpoint-captcha",
+    "data-marker=\"captcha\"",
+)
+
+
+def _is_browser_page_blocked(html: str) -> bool:
+    lowered = html.lower()
+    return any(marker in lowered for marker in _BLOCK_MARKERS)
+
 
 class BrowserScraper:
     """Сканирование через браузер — нужно, когда Авито грузит объявления через JavaScript."""
@@ -64,6 +77,13 @@ class BrowserScraper:
                 try:
                     page.goto(url, wait_until="domcontentloaded", timeout=60000)
                     page.wait_for_timeout(3000)
+                    html = page.content()
+                    if _is_browser_page_blocked(html):
+                        logger.error(
+                            "Браузер: Авито заблокировал доступ (капча / 429). "
+                            "Попробуйте позже или смените IP."
+                        )
+                        break
                     try:
                         page.wait_for_selector('[data-marker="item"]', timeout=20000)
                     except PlaywrightTimeoutError:
@@ -75,7 +95,6 @@ class BrowserScraper:
                     logger.warning("Браузер: таймаут загрузки страницы %s: %s", page_num, exc)
                     break
 
-                html = page.content()
                 if page_num == 1:
                     total_found = _extract_total_count_from_html(html) or total_found
                     if total_found:

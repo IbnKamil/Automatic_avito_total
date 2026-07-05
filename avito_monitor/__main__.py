@@ -21,12 +21,22 @@ def build_parser() -> argparse.ArgumentParser:
     scan_parser = subparsers.add_parser("scan", help="Выполнить одно сканирование и отчёт")
     scan_parser.add_argument("--no-email", action="store_true", help="Не отправлять email")
     scan_parser.add_argument("--demo", action="store_true", help="Использовать демо-данные")
+    scan_parser.add_argument(
+        "--browser-only",
+        action="store_true",
+        help="Только браузер Playwright, без HTTP/API (быстрее при блокировке 429)",
+    )
 
     schedule_parser = subparsers.add_parser(
         "schedule",
         help="Запустить планировщик (отчёт каждые N дней)",
     )
     schedule_parser.add_argument("--demo", action="store_true", help="Использовать демо-данные")
+    schedule_parser.add_argument(
+        "--browser-only",
+        action="store_true",
+        help="Только браузер Playwright, без HTTP/API",
+    )
 
     subparsers.add_parser("resolve-region", help="Определить slug и location_id региона на Авито")
 
@@ -54,6 +64,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if getattr(args, "demo", False):
         config.demo_mode = True
+    if getattr(args, "browser_only", False):
+        config.browser_only = True
+        config.use_browser = True
 
     if args.command == "resolve-region":
         slug, location_id = resolve_location_id(config.region)
@@ -75,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Email: {config.smtp_to or 'не настроен'}")
         print(f"Демо-режим: {config.demo_mode}")
         print(f"Режим браузера: {config.use_browser}")
+        print(f"Только браузер: {config.browser_only}")
         print(f"Папка отчётов: {Path(config.reports_dir).resolve()}")
         print(f"База данных: {Path(config.database_path).resolve()}")
         return 0

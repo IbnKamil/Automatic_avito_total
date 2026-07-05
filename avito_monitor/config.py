@@ -29,6 +29,7 @@ class AppConfig:
     proxy: str = ""
     demo_mode: bool = False
     use_browser: bool = True
+    browser_only: bool = False
     rate_limit_backoff_seconds: float = 15.0
 
 
@@ -133,6 +134,7 @@ def load_config(config_path: str | Path = "config.yaml") -> AppConfig:
     config.proxy = os.getenv("PROXY", config.proxy)
     config.demo_mode = _env_bool("DEMO_MODE", config.demo_mode)
     config.use_browser = _env_bool("USE_BROWSER", config.use_browser)
+    config.browser_only = _env_bool("BROWSER_ONLY", config.browser_only)
     config.rate_limit_backoff_seconds = _env_float(
         "RATE_LIMIT_BACKOFF_SECONDS", config.rate_limit_backoff_seconds
     )
