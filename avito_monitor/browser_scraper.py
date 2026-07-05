@@ -11,6 +11,7 @@ from avito_monitor.models import Listing
 from avito_monitor.scraper import (
     AVITO_BASE,
     _extract_city,
+    _extract_total_count_from_api_payload,
     _extract_total_count_from_html,
     _item_from_api_payload,
     _matches_product,
@@ -91,10 +92,11 @@ class BrowserScraper:
 
         listings: list[Listing] = []
         seen_ids: set[int] = set()
-        total_found = 0
+        avito_total = 0
         pages_scanned = 0
         max_pages = self.config.max_pages
         blocked = False
+        consecutive_no_new = 0
         profile_dir = resolve_project_path(self.config.browser_profile_dir)
         profile_dir.mkdir(parents=True, exist_ok=True)
 
@@ -143,13 +145,26 @@ class BrowserScraper:
                 url = self.search_url_builder(page_num)
                 mode = "скрытый" if headless else "видимый"
                 logger.info("Браузер (%s): страница %s — %s", mode, page_num, url)
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=90000)
-                    self._wait_for_content(page)
-                    html = page.content()
-                except PlaywrightTimeoutError as exc:
-                    logger.warning("Браузер: таймаут загрузки страницы %s: %s", page_num, exc)
-                    html = page.content()
+
+                html = ""
+                for attempt in range(2):
+                    try:
+                        page.goto(url, wait_until="domcontentloaded", timeout=90000)
+                        self._wait_for_content(page)
+                        html = page.content()
+                        break
+                    except PlaywrightTimeoutError as exc:
+                        if attempt == 0:
+                            logger.warning(
+                                "Браузер: таймаут страницы %s, повтор через 5 сек...",
+                                page_num,
+                            )
+                            page.wait_for_timeout(5000)
+                            continue
+                        logger.warning(
+                            "Браузер: таймаут загрузки страницы %s: %s", page_num, exc
+                        )
+                        html = page.content()
 
                 if _is_browser_page_blocked(html):
                     blocked = True
@@ -158,20 +173,26 @@ class BrowserScraper:
                     break
 
                 if page_num == 1:
-                    total_found = _extract_total_count_from_html(html) or total_found
-                    if total_found:
-                        logger.info("Браузер: на Авито найдено объявлений: %s", total_found)
-                    max_pages = min(
-                        self.config.max_pages,
-                        max(1, (total_found + 49) // 50) if total_found else self.config.max_pages,
-                    )
+                    avito_total = _extract_total_count_from_html(html) or 0
+                    if avito_total:
+                        logger.info("Браузер: на Авито найдено объявлений: %s", avito_total)
+
+                for payload in api_payloads:
+                    api_total = _extract_total_count_from_api_payload(payload)
+                    if api_total:
+                        avito_total = max(avito_total, api_total)
 
                 page_listings = self._collect_page_listings(page, html, api_payloads)
+                card_count = page.locator('[data-marker="item"]').count()
                 added = 0
+                skipped_seen = 0
+                skipped_filter = 0
                 for listing in page_listings:
                     if listing.avito_id in seen_ids:
+                        skipped_seen += 1
                         continue
                     if not listing.title or not _matches_product(listing.title, self.config.product):
+                        skipped_filter += 1
                         continue
                     seen_ids.add(listing.avito_id)
                     listings.append(listing)
@@ -182,28 +203,52 @@ class BrowserScraper:
                     logger.warning(
                         "Браузер: на странице 1 нет релевантных объявлений "
                         "(карточек в DOM: %s, ответов API: %s)",
-                        page.locator('[data-marker="item"]').count(),
+                        card_count,
                         len(api_payloads),
                     )
 
-                if added == 0:
+                if not page_listings and card_count == 0:
+                    logger.info("Браузер: страница %s пуста — конец выдачи", page_num)
                     break
 
+                if added == 0:
+                    consecutive_no_new += 1
+                    logger.info(
+                        "Браузер: страница %s — новых объявлений нет "
+                        "(карточек %s, дубликатов %s, отфильтровано %s, подряд: %s)",
+                        page_num,
+                        len(page_listings),
+                        skipped_seen,
+                        skipped_filter,
+                        consecutive_no_new,
+                    )
+                    if consecutive_no_new >= self.config.browser_max_empty_pages:
+                        logger.info(
+                            "Браузер: остановка — %s страниц подряд без новых объявлений",
+                            consecutive_no_new,
+                        )
+                        break
+                    time.sleep(self.config.request_delay_seconds)
+                    continue
+
+                consecutive_no_new = 0
                 pages_scanned += 1
                 logger.info(
-                    "Браузер страница %s: добавлено %s, всего %s",
+                    "Браузер страница %s: добавлено %s, всего %s "
+                    "(дубликатов %s, отфильтровано %s)",
                     page_num,
                     added,
                     len(listings),
+                    skipped_seen,
+                    skipped_filter,
                 )
 
-                if total_found and len(listings) >= total_found:
-                    break
                 time.sleep(self.config.request_delay_seconds)
 
             context.close()
 
-        return listings, total_found or len(listings), pages_scanned, blocked
+        reported_total = max(avito_total, len(listings))
+        return listings, reported_total, pages_scanned, blocked
 
     def _wait_for_content(self, page) -> None:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError

@@ -219,14 +219,26 @@ def _extract_total_count_from_html(html: str) -> int | None:
         r"(\d[\d\s\xa0]+)\s+объявлен",
         r'"totalCount"\s*:\s*(\d+)',
         r'"foundCount"\s*:\s*(\d+)',
-        r'"count"\s*:\s*(\d+)',
     )
     for pattern in patterns:
         match = re.search(pattern, html, flags=re.IGNORECASE)
         if match:
             digits = re.sub(r"\D", "", match.group(1))
             if digits:
-                return int(digits)
+                value = int(digits)
+                if value >= 1:
+                    return value
+    return None
+
+
+def _extract_total_count_from_api_payload(payload: dict[str, Any]) -> int | None:
+    for key in ("totalCount", "foundCount", "count"):
+        value = payload.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
     return None
 
 

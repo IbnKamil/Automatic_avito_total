@@ -33,6 +33,7 @@ class AppConfig:
     browser_headless: bool = True
     browser_profile_dir: str = "data/browser_profile"
     export_pdf: bool = True
+    browser_max_empty_pages: int = 3
     rate_limit_backoff_seconds: float = 15.0
 
 
@@ -141,6 +142,9 @@ def load_config(config_path: str | Path = "config.yaml") -> AppConfig:
     config.browser_headless = _env_bool("BROWSER_HEADLESS", config.browser_headless)
     config.browser_profile_dir = os.getenv("BROWSER_PROFILE_DIR", config.browser_profile_dir)
     config.export_pdf = _env_bool("EXPORT_PDF", config.export_pdf)
+    config.browser_max_empty_pages = _env_int(
+        "BROWSER_MAX_EMPTY_PAGES", config.browser_max_empty_pages
+    )
     config.rate_limit_backoff_seconds = _env_float(
         "RATE_LIMIT_BACKOFF_SECONDS", config.rate_limit_backoff_seconds
     )
