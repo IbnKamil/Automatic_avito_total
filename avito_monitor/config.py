@@ -30,6 +30,8 @@ class AppConfig:
     demo_mode: bool = False
     use_browser: bool = True
     browser_only: bool = False
+    browser_headless: bool = True
+    browser_profile_dir: str = "data/browser_profile"
     rate_limit_backoff_seconds: float = 15.0
 
 
@@ -135,9 +137,12 @@ def load_config(config_path: str | Path = "config.yaml") -> AppConfig:
     config.demo_mode = _env_bool("DEMO_MODE", config.demo_mode)
     config.use_browser = _env_bool("USE_BROWSER", config.use_browser)
     config.browser_only = _env_bool("BROWSER_ONLY", config.browser_only)
+    config.browser_headless = _env_bool("BROWSER_HEADLESS", config.browser_headless)
+    config.browser_profile_dir = os.getenv("BROWSER_PROFILE_DIR", config.browser_profile_dir)
     config.rate_limit_backoff_seconds = _env_float(
         "RATE_LIMIT_BACKOFF_SECONDS", config.rate_limit_backoff_seconds
     )
     config.database_path = str(resolve_project_path(config.database_path, root))
+    config.browser_profile_dir = str(resolve_project_path(config.browser_profile_dir, root))
     config.reports_dir = str(resolve_project_path(config.reports_dir, root))
     return config

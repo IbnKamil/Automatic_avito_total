@@ -3,18 +3,19 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urljoin
 
-from avito_monitor.config import AppConfig
+from avito_monitor.config import AppConfig, resolve_project_path
 from avito_monitor.models import Listing
 from avito_monitor.scraper import (
     AVITO_BASE,
     _extract_city,
     _extract_total_count_from_html,
+    _item_from_api_payload,
     _matches_product,
+    _parse_page_listings,
     _parse_price,
-    build_listing_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,8 +25,21 @@ _BLOCK_MARKERS = (
     "firewall/captcha",
     "подтвердите, что вы не робот",
     "checkpoint-captcha",
-    "data-marker=\"captcha\"",
+    'data-marker="captcha"',
 )
+
+_API_URL_MARKERS = (
+    "/web/1/js/items",
+    "/web/1/main/items",
+    "/api/9/items",
+)
+
+_STEALTH_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+window.chrome = { runtime: {} };
+Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en-US', 'en'] });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+"""
 
 
 def _is_browser_page_blocked(html: str) -> bool:
@@ -42,57 +56,105 @@ class BrowserScraper:
 
     def scan(self) -> tuple[list[Listing], int, int]:
         try:
-            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
             raise RuntimeError(
                 "Для режима браузера установите Playwright:\n"
                 "  pip install playwright\n"
-                "  playwright install chromium"
+                "  python -m playwright install chromium"
             ) from exc
+
+        listings, total_found, pages_scanned, blocked = self._run(headless=self.config.browser_headless)
+        if not listings and self.config.browser_headless:
+            logger.info(
+                "Скрытый браузер не нашёл объявления — пробую видимое окно "
+                "(можно пройти капчу вручную)..."
+            )
+            visible_listings, visible_total, visible_pages, visible_blocked = self._run(
+                headless=False
+            )
+            if visible_listings:
+                return visible_listings, visible_total, visible_pages
+            blocked = blocked or visible_blocked
+
+        if blocked and not listings:
+            logger.error(
+                "Авито показал капчу или заблокировал IP. "
+                "Запустите: python -m avito_monitor scan --visible-browser --no-email"
+            )
+
+        return listings, total_found or len(listings), pages_scanned
+
+    def _run(self, headless: bool) -> tuple[list[Listing], int, int, bool]:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
 
         listings: list[Listing] = []
         seen_ids: set[int] = set()
         total_found = 0
         pages_scanned = 0
         max_pages = self.config.max_pages
+        blocked = False
+        profile_dir = resolve_project_path(self.config.browser_profile_dir)
+        profile_dir.mkdir(parents=True, exist_ok=True)
 
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-            context_kwargs: dict = {
+            launch_kwargs: dict[str, Any] = {
+                "headless": headless,
                 "locale": "ru-RU",
+                "viewport": {"width": 1366, "height": 900},
                 "user_agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                 ),
+                "args": ["--disable-blink-features=AutomationControlled"],
             }
             if self.config.proxy:
-                context_kwargs["proxy"] = {"server": self.config.proxy}
-            context = browser.new_context(**context_kwargs)
-            page = context.new_page()
+                launch_kwargs["proxy"] = {"server": self.config.proxy}
+
+            context = playwright.chromium.launch_persistent_context(
+                str(profile_dir),
+                **launch_kwargs,
+            )
+            context.add_init_script(_STEALTH_SCRIPT)
+            page = context.pages[0] if context.pages else context.new_page()
+            api_payloads: list[dict[str, Any]] = []
+
+            def on_response(response) -> None:
+                url = response.url
+                if not any(marker in url for marker in _API_URL_MARKERS):
+                    return
+                try:
+                    if response.status != 200:
+                        return
+                    body = response.json()
+                except Exception:
+                    return
+                if isinstance(body, dict) and body.get("too-many-requests"):
+                    logger.warning("Браузер: API заблокирован (429)")
+                    return
+                if isinstance(body, dict) and body.get("items"):
+                    api_payloads.append(body)
+
+            page.on("response", on_response)
 
             for page_num in range(1, max_pages + 1):
+                api_payloads.clear()
                 url = self.search_url_builder(page_num)
-                logger.info("Браузер: открываю страницу %s — %s", page_num, url)
+                mode = "скрытый" if headless else "видимый"
+                logger.info("Браузер (%s): страница %s — %s", mode, page_num, url)
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_timeout(3000)
+                    page.goto(url, wait_until="domcontentloaded", timeout=90000)
+                    self._wait_for_content(page)
                     html = page.content()
-                    if _is_browser_page_blocked(html):
-                        logger.error(
-                            "Браузер: Авито заблокировал доступ (капча / 429). "
-                            "Попробуйте позже или смените IP."
-                        )
-                        break
-                    try:
-                        page.wait_for_selector('[data-marker="item"]', timeout=20000)
-                    except PlaywrightTimeoutError:
-                        logger.warning("Браузер: на странице %s нет карточек объявлений", page_num)
-                        if page_num == 1:
-                            break
-                        break
                 except PlaywrightTimeoutError as exc:
                     logger.warning("Браузер: таймаут загрузки страницы %s: %s", page_num, exc)
+                    html = page.content()
+
+                if _is_browser_page_blocked(html):
+                    blocked = True
+                    self._save_debug(page, html, page_num, "blocked")
+                    logger.error("Браузер: страница заблокирована (капча / 429)")
                     break
 
                 if page_num == 1:
@@ -104,20 +166,10 @@ class BrowserScraper:
                         max(1, (total_found + 49) // 50) if total_found else self.config.max_pages,
                     )
 
-                cards = page.locator('[data-marker="item"]')
-                card_count = cards.count()
-                if card_count == 0:
-                    break
-
+                page_listings = self._collect_page_listings(page, html, api_payloads)
                 added = 0
-                for index in range(card_count):
-                    card = cards.nth(index)
-                    try:
-                        listing = self._parse_card(card)
-                    except Exception as exc:
-                        logger.debug("Браузер: пропуск карточки %s: %s", index, exc)
-                        continue
-                    if not listing or listing.avito_id in seen_ids:
+                for listing in page_listings:
+                    if listing.avito_id in seen_ids:
                         continue
                     if not listing.title or not _matches_product(listing.title, self.config.product):
                         continue
@@ -125,29 +177,119 @@ class BrowserScraper:
                     listings.append(listing)
                     added += 1
 
+                if added == 0 and page_num == 1:
+                    self._save_debug(page, html, page_num, "empty")
+                    logger.warning(
+                        "Браузер: на странице 1 нет релевантных объявлений "
+                        "(карточек в DOM: %s, ответов API: %s)",
+                        page.locator('[data-marker="item"]').count(),
+                        len(api_payloads),
+                    )
+
+                if added == 0:
+                    break
+
                 pages_scanned += 1
                 logger.info(
-                    "Браузер страница %s: карточек %s, добавлено %s, всего %s",
+                    "Браузер страница %s: добавлено %s, всего %s",
                     page_num,
-                    card_count,
                     added,
                     len(listings),
                 )
 
                 if total_found and len(listings) >= total_found:
                     break
-                if added == 0:
-                    break
                 time.sleep(self.config.request_delay_seconds)
 
-            browser.close()
+            context.close()
 
-        return listings, total_found or len(listings), pages_scanned
+        return listings, total_found or len(listings), pages_scanned, blocked
+
+    def _wait_for_content(self, page) -> None:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=25000)
+        except PlaywrightTimeoutError:
+            pass
+        for selector in (
+            '[data-marker="item"]',
+            '[data-marker="catalog-serp"]',
+            "article[data-item-id]",
+        ):
+            try:
+                page.wait_for_selector(selector, timeout=12000)
+                break
+            except PlaywrightTimeoutError:
+                continue
+        for _ in range(3):
+            page.evaluate("window.scrollBy(0, Math.max(500, window.innerHeight * 0.8))")
+            page.wait_for_timeout(1200)
+
+    def _collect_page_listings(
+        self,
+        page,
+        html: str,
+        api_payloads: list[dict[str, Any]],
+    ) -> list[Listing]:
+        listings: list[Listing] = []
+        seen: set[int] = set()
+
+        for payload in api_payloads:
+            for item in payload.get("items") or []:
+                listing = _item_from_api_payload(item, self.config)
+                if listing and listing.avito_id not in seen:
+                    seen.add(listing.avito_id)
+                    listings.append(listing)
+
+        if listings:
+            logger.info("Браузер: получено %s объявлений из API-ответов", len(listings))
+            return listings
+
+        cards = page.locator('[data-marker="item"]')
+        card_count = cards.count()
+        for index in range(card_count):
+            card = cards.nth(index)
+            try:
+                listing = self._parse_card(card)
+            except Exception as exc:
+                logger.debug("Браузер: пропуск карточки %s: %s", index, exc)
+                continue
+            if listing and listing.avito_id not in seen:
+                seen.add(listing.avito_id)
+                listings.append(listing)
+
+        if listings:
+            logger.info("Браузер: получено %s объявлений из DOM", len(listings))
+            return listings
+
+        for listing in _parse_page_listings(html, self.config):
+            if listing.avito_id not in seen:
+                seen.add(listing.avito_id)
+                listings.append(listing)
+        if listings:
+            logger.info("Браузер: получено %s объявлений из HTML/JSON", len(listings))
+        return listings
+
+    def _save_debug(self, page, html: str, page_num: int, reason: str) -> None:
+        debug_dir = resolve_project_path(self.config.reports_dir) / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        html_path = debug_dir / f"browser_{reason}_p{page_num}_{stamp}.html"
+        png_path = debug_dir / f"browser_{reason}_p{page_num}_{stamp}.png"
+        try:
+            html_path.write_text(html, encoding="utf-8")
+            page.screenshot(path=str(png_path), full_page=True)
+            logger.info("Диагностика сохранена: %s и %s", html_path, png_path)
+        except Exception as exc:
+            logger.debug("Не удалось сохранить диагностику: %s", exc)
 
     def _parse_card(self, card) -> Listing | None:
         link = card.locator('[data-marker="item-title"]').first
         if link.count() == 0:
             link = card.locator("a[itemprop='url']").first
+        if link.count() == 0:
+            link = card.locator("a[href]").first
         if link.count() == 0:
             return None
 

@@ -26,6 +26,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Только браузер Playwright, без HTTP/API (быстрее при блокировке 429)",
     )
+    scan_parser.add_argument(
+        "--visible-browser",
+        action="store_true",
+        help="Открыть видимое окно браузера (для прохождения капчи)",
+    )
 
     schedule_parser = subparsers.add_parser(
         "schedule",
@@ -67,6 +72,9 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "browser_only", False):
         config.browser_only = True
         config.use_browser = True
+    if getattr(args, "visible_browser", False):
+        config.browser_headless = False
+        config.use_browser = True
 
     if args.command == "resolve-region":
         slug, location_id = resolve_location_id(config.region)
@@ -89,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Демо-режим: {config.demo_mode}")
         print(f"Режим браузера: {config.use_browser}")
         print(f"Только браузер: {config.browser_only}")
+        print(f"Скрытый браузер: {config.browser_headless}")
         print(f"Папка отчётов: {Path(config.reports_dir).resolve()}")
         print(f"База данных: {Path(config.database_path).resolve()}")
         return 0

@@ -1064,13 +1064,16 @@ class AvitoScraper:
             if self.config.browser_only or self.config.use_browser:
                 raise AvitoScraperError(
                     f"Браузерное сканирование не дало результатов для «{self.config.product}» "
-                    f"в регионе «{self.config.region}». "
-                    f"Возможна блокировка IP или капча на Авито.\n"
-                    f"Установите Playwright:\n"
-                    f"  pip install playwright\n"
-                    f"  python -m playwright install chromium\n"
-                    f"Попробуйте позже, смените интернет или укажите PROXY в .env.\n"
-                    f"Проверка в браузере: {self._search_url(1)}"
+                    f"в регионе «{self.config.region}».\n"
+                    f"Скорее всего Авито заблокировал IP или показал капчу.\n\n"
+                    f"Попробуйте:\n"
+                    f"  1. git pull origin cursor/avito-bench-monitor-b4b9\n"
+                    f"  2. python -m avito_monitor scan --visible-browser --no-email\n"
+                    f"     (откроется окно Chrome — пройдите капчу если появится)\n"
+                    f"  3. Подождите 30–60 мин и повторите\n"
+                    f"  4. Смените интернет или укажите PROXY в .env\n\n"
+                    f"Диагностика сохраняется в reports/debug/\n"
+                    f"Проверка вручную: {self._search_url(1)}"
                 )
 
         try:
