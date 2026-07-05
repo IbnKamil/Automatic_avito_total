@@ -24,6 +24,8 @@ LOCATIONS_API = (
     "?includeRefs=1&key=7myrcPqWwSzInUCSvdwrtWcibz8pwaSNEMlRturi"
 )
 ITEMS_API = "https://www.avito.ru/web/1/main/items"
+MOBILE_ITEMS_API = "https://www.avito.ru/api/9/items"
+MOBILE_API_KEY = "ZaeC8aidairahqu2Eeb1quee9einaeFieboocohX"
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -111,8 +113,37 @@ def _matches_product(title: str, product: str) -> bool:
         return True
     if product_lower in title_lower:
         return True
-    stems = [product_lower[: max(4, len(product_lower) - 2)], product_lower.rstrip("и")]
-    return any(stem and stem in title_lower for stem in stems)
+    stems = {
+        product_lower,
+        product_lower.rstrip("и"),
+        product_lower.rstrip("ы"),
+        product_lower[: max(5, len(product_lower) - 2)],
+    }
+    return any(stem and stem in title_lower for stem in stems if stem)
+
+
+def _is_html_blocked(html: str) -> bool:
+    lowered = html.lower()
+    if len(html) < 8000 and (
+        "доступ с вашего ip-адреса временно ограничен" in lowered
+        or "too-many-requests" in lowered
+    ):
+        return True
+    block_markers = (
+        "доступ с вашего ip-адреса временно ограничен",
+        "firewall/captcha/show",
+        "подтвердите, что вы не робот",
+        "data-marker=\"captcha\"",
+        "data-marker='captcha'",
+        "checkpoint-captcha",
+    )
+    return any(marker in lowered for marker in block_markers)
+
+
+def _is_api_blocked(payload: Any) -> bool:
+    if isinstance(payload, dict):
+        return "too-many-requests" in payload
+    return False
 
 
 def _matches_region(
@@ -141,6 +172,36 @@ def _matches_region(
     if any(marker in location_lower for marker in foreign_markers):
         return False
     return True
+
+
+def _item_from_mobile_payload(item: dict[str, Any], config: AppConfig) -> Listing | None:
+    avito_id = item.get("id")
+    if not avito_id:
+        return None
+    title = item.get("title") or "Без названия"
+    price, price_string = _parse_price(item.get("price") or item.get("priceDetailed"))
+    location = item.get("address") or item.get("location") or ""
+    url_value = item.get("url") or item.get("uri") or item.get("urlPath") or ""
+    if url_value and not str(url_value).startswith("http"):
+        url = build_listing_url(str(url_value), int(avito_id), config.region_slug)
+    else:
+        url = str(url_value) if url_value else build_listing_url(None, int(avito_id), config.region_slug)
+    images = item.get("images") or []
+    image_url = ""
+    if images and isinstance(images[0], dict):
+        image_url = next(iter(images[0].values()), "")
+    return Listing(
+        avito_id=int(avito_id),
+        title=title.strip(),
+        price=price,
+        price_string=price_string,
+        url=url,
+        location=location,
+        city=_extract_city(location),
+        image_url=image_url,
+        posted_at=None,
+        raw=item,
+    )
 
 
 def _item_from_api_payload(item: dict[str, Any], config: AppConfig) -> Listing | None:
@@ -322,13 +383,18 @@ class AvitoScraper:
             params += f"&p={page}"
         return f"{AVITO_BASE}/{self.config.region_slug}?{params}"
 
-    def _is_blocked(self, payload: Any) -> bool:
-        if isinstance(payload, dict) and "too-many-requests" in payload:
-            return True
-        if isinstance(payload, str):
-            lowered = payload.lower()
-            return "captcha" in lowered or "ограничен" in lowered
-        return False
+    def _request_with_retry(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        last_error: Exception | None = None
+        for attempt in range(3):
+            response = self.session.request(method, url, **kwargs)
+            if response.status_code not in {429, 503}:
+                return response
+            last_error = AvitoBlockedError(response.text)
+            logger.warning("Авито вернул %s, повтор через %s сек.", response.status_code, 2 + attempt)
+            time.sleep(2 + attempt)
+        if last_error:
+            raise last_error
+        raise AvitoBlockedError("Превышено число попыток запроса к Авито")
 
     def _accept_listing(self, listing: Listing) -> bool:
         if not _matches_product(listing.title, self.config.product):
@@ -358,16 +424,17 @@ class AvitoScraper:
         params = {"q": self.config.product}
         if page > 1:
             params["p"] = page
-        response = self.session.get(
+        response = self._request_with_retry(
+            "GET",
             f"{AVITO_BASE}/{self.config.region_slug}",
             params=params,
             headers={"Referer": self._search_referer(page)},
             timeout=30,
         )
-        if response.status_code in {403, 429}:
+        if response.status_code == 403:
             raise AvitoBlockedError(response.text)
         response.raise_for_status()
-        if self._is_blocked(response.text):
+        if _is_html_blocked(response.text):
             raise AvitoBlockedError("HTML-страница заблокирована")
         return response.text
 
@@ -379,19 +446,44 @@ class AvitoScraper:
             "page": page,
             "limit": 50,
         }
-        response = self.session.get(
+        response = self._request_with_retry(
+            "GET",
             ITEMS_API,
             params=params,
             headers={"Referer": self._search_referer(page)},
             timeout=30,
         )
-        if response.status_code in {403, 429}:
+        if response.status_code == 403:
             raise AvitoBlockedError(response.text)
         response.raise_for_status()
         data = response.json()
-        if self._is_blocked(data):
+        if _is_api_blocked(data):
             raise AvitoBlockedError(json.dumps(data, ensure_ascii=False))
         return data
+
+    def _fetch_mobile_page(self, page: int) -> list[dict[str, Any]]:
+        params = {
+            "query": self.config.product,
+            "locationId": self.config.location_id,
+            "page": page,
+            "key": MOBILE_API_KEY,
+        }
+        response = self._request_with_retry(
+            "GET",
+            MOBILE_ITEMS_API,
+            params=params,
+            headers={"User-Agent": "AVITO 52.0 (iPad5,1; 11.3.1; ru_RU)"},
+            timeout=30,
+        )
+        if response.status_code == 403:
+            raise AvitoBlockedError(response.text)
+        response.raise_for_status()
+        data = response.json()
+        if _is_api_blocked(data):
+            raise AvitoBlockedError(json.dumps(data, ensure_ascii=False))
+        result = data.get("result", data)
+        items = result.get("items") if isinstance(result, dict) else None
+        return items or []
 
     def _scan_html(self) -> tuple[list[Listing], int, int]:
         listings: list[Listing] = []
@@ -453,6 +545,30 @@ class AvitoScraper:
 
         return listings, total_found or len(listings), pages_scanned
 
+    def _scan_mobile_api(self) -> tuple[list[Listing], int, int]:
+        listings: list[Listing] = []
+        seen_ids: set[int] = set()
+        pages_scanned = 0
+
+        for page in range(1, self.config.max_pages + 1):
+            page_items = self._fetch_mobile_page(page)
+            if not page_items:
+                break
+
+            added = 0
+            for item in page_items:
+                if self._add_listing(_item_from_mobile_payload(item, self.config), listings, seen_ids):
+                    added += 1
+
+            pages_scanned += 1
+            if added == 0:
+                break
+            if len(page_items) < 30:
+                break
+            time.sleep(self.config.request_delay_seconds)
+
+        return listings, len(listings), pages_scanned
+
     def scan(self) -> ScanResult:
         if self.config.demo_mode:
             listings = _generate_demo_listings(
@@ -473,18 +589,28 @@ class AvitoScraper:
         total_found = 0
         pages_scanned = 0
         source = "html"
+        last_block_error: AvitoBlockedError | None = None
 
-        try:
-            listings, total_found, pages_scanned = self._scan_html()
-            if not listings:
-                source = "api"
-                listings, total_found, pages_scanned = self._scan_api()
-        except AvitoBlockedError as exc:
+        for method_name, scanner in (
+            ("html", self._scan_html),
+            ("api", self._scan_api),
+            ("mobile-api", self._scan_mobile_api),
+        ):
+            try:
+                listings, total_found, pages_scanned = scanner()
+                if listings:
+                    source = method_name
+                    break
+            except AvitoBlockedError as exc:
+                last_block_error = exc
+                logger.warning("Способ %s недоступен: %s", method_name, exc)
+
+        if not listings and last_block_error:
             raise AvitoScraperError(
-                "Авито заблокировал запросы. Запустите программу с российского IP "
-                "или укажите PROXY в .env. Для теста без Авито используйте: "
-                "python -m avito_monitor scan --demo --no-email"
-            ) from exc
+                "Авито заблокировал все способы получения объявлений. "
+                "Попробуйте позже, запустите с другого интернета или укажите PROXY в .env. "
+                "Для теста отчёта без Авито: python -m avito_monitor scan --demo --no-email"
+            ) from last_block_error
 
         if not listings:
             raise AvitoScraperError(
