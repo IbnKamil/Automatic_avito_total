@@ -31,6 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Открыть видимое окно браузера (для прохождения капчи)",
     )
+    scan_parser.add_argument(
+        "--no-pdf",
+        action="store_true",
+        help="Не создавать PDF-версию отчёта",
+    )
 
     schedule_parser = subparsers.add_parser(
         "schedule",
@@ -75,6 +80,8 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "visible_browser", False):
         config.browser_headless = False
         config.use_browser = True
+    if getattr(args, "no_pdf", False):
+        config.export_pdf = False
 
     if args.command == "resolve-region":
         slug, location_id = resolve_location_id(config.region)
@@ -98,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Режим браузера: {config.use_browser}")
         print(f"Только браузер: {config.browser_only}")
         print(f"Скрытый браузер: {config.browser_headless}")
+        print(f"Экспорт в PDF: {config.export_pdf}")
         print(f"Папка отчётов: {Path(config.reports_dir).resolve()}")
         print(f"База данных: {Path(config.database_path).resolve()}")
         return 0

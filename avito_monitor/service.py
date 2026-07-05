@@ -10,6 +10,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from avito_monitor.analyzer import MarketAnalyzer
 from avito_monitor.config import AppConfig
 from avito_monitor.mailer import EmailSender
+from avito_monitor.pdf_exporter import PdfExportError, export_html_to_pdf
 from avito_monitor.reporter import ReportBuilder
 from avito_monitor.scraper import AvitoScraper, export_listings_csv
 from avito_monitor.storage import ListingStorage
@@ -48,6 +49,13 @@ class MonitorService:
             self.reports_dir, scan, html, chart_paths, csv_path=csv_path
         )
 
+        pdf_path: Path | None = None
+        if self.config.export_pdf:
+            try:
+                pdf_path = export_html_to_pdf(report_path)
+            except PdfExportError as exc:
+                logger.warning("PDF не создан: %s", exc)
+
         if send_email:
             if self.mailer.is_configured():
                 subject = (
@@ -55,11 +63,17 @@ class MonitorService:
                     f"{self.config.region} ({datetime.utcnow().strftime('%d.%m.%Y')})"
                 )
                 embedded = ReportBuilder.embed_charts_for_email(chart_blocks)
+                attachments: list[Path] = []
+                if pdf_path and pdf_path.exists():
+                    attachments.append(pdf_path)
+                else:
+                    attachments.append(report_path)
+                attachments.append(csv_path)
                 self.mailer.send_report(
                     subject,
                     ReportBuilder.html_for_email(html, chart_blocks),
                     embedded,
-                    attachment_paths=[report_path, csv_path],
+                    attachment_paths=attachments,
                 )
                 logger.info("Отчёт отправлен на %s", self.config.smtp_to)
             else:
@@ -68,6 +82,8 @@ class MonitorService:
                 )
 
         logger.info("Сканирование завершено. Отчёт: %s", report_path.resolve())
+        if pdf_path and pdf_path.exists():
+            logger.info("PDF-отчёт: %s", pdf_path.resolve())
         return report_path
 
     def start_scheduler(self) -> None:

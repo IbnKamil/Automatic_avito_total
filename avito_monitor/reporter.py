@@ -33,6 +33,14 @@ REPORT_TEMPLATE = Template(
     .note-inline { color: #b45309; }
     .all-listings { font-size: 14px; }
     .all-listings td, .all-listings th { padding: 8px; }
+    @media print {
+      body { background: #fff; padding: 0; }
+      .container { box-shadow: none; padding: 0; }
+      h2 { page-break-after: avoid; }
+      img { page-break-inside: avoid; max-height: 240mm; }
+      table { page-break-inside: auto; }
+      tr { page-break-inside: avoid; }
+    }
   </style>
 </head>
 <body>
