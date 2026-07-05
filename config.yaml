@@ -1,0 +1,22 @@
+product: "Скамейки"
+region: "Дагестан"
+region_slug: "dagestan"
+location_id: 646710
+
+report_interval_days: 3
+max_pages: 50
+request_delay_seconds: 2.0
+
+database_path: "data/listings.db"
+reports_dir: "reports"
+
+smtp:
+  host: "smtp.gmail.com"
+  port: 587
+  use_tls: true
+  username: ""
+  password: ""
+  from_email: ""
+  to_email: ""
+
+proxy: ""
