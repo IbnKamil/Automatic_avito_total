@@ -6,6 +6,7 @@ import logging
 import random
 import re
 import time
+from collections import Counter
 from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import quote, urljoin, urlparse
@@ -129,31 +130,47 @@ def _parse_price(value: Any) -> tuple[int | None, str]:
         if amount is None and label:
             digits = re.sub(r"[^\d]", "", label)
             amount = int(digits) if digits else None
+        if amount is not None and amount <= 0:
+            return None, label or "Цена не указана"
         return (int(amount) if amount is not None else None), label or "Цена не указана"
     if isinstance(value, (int, float)):
         amount = int(value)
+        if amount <= 0:
+            return None, "Цена не указана"
         return amount, f"{amount:,}".replace(",", " ") + " ₽"
     if isinstance(value, str):
         digits = re.sub(r"[^\d]", "", value)
         amount = int(digits) if digits else None
+        if amount is not None and amount <= 0:
+            return None, value or "Цена не указана"
         return amount, value
     return None, "Цена не указана"
 
 
+def _product_keywords(product: str) -> set[str]:
+    product_lower = product.lower().strip()
+    keywords = set()
+    if not product_lower:
+        return keywords
+    keywords.update(
+        {
+            product_lower,
+            product_lower.rstrip("и"),
+            product_lower.rstrip("ы"),
+            product_lower.rstrip("а"),
+        }
+    )
+    if "скамей" in product_lower or product_lower.startswith("скам"):
+        keywords.update({"скамей", "скамейк", "скамья", "лавка", "садовая лавка"})
+    return {kw for kw in keywords if kw}
+
+
 def _matches_product(title: str, product: str) -> bool:
     title_lower = title.lower()
-    product_lower = product.lower().strip()
-    if not product_lower:
+    keywords = _product_keywords(product)
+    if not keywords:
         return True
-    if product_lower in title_lower:
-        return True
-    stems = {
-        product_lower,
-        product_lower.rstrip("и"),
-        product_lower.rstrip("ы"),
-        product_lower[: max(5, len(product_lower) - 2)],
-    }
-    return any(stem and stem in title_lower for stem in stems if stem)
+    return any(keyword in title_lower for keyword in keywords)
 
 
 def _is_html_blocked(html: str) -> bool:
@@ -214,10 +231,12 @@ def _extract_total_count_from_html(html: str) -> int | None:
 
 
 def _extract_search_context(html: str) -> str | None:
+    contexts = re.findall(r"context=(H4sI[A-Za-z0-9+/=_\-]+)", html)
+    if contexts:
+        return Counter(contexts).most_common(1)[0][0]
     patterns = (
         r'"context"\s*:\s*"(H4sI[^"]+)"',
         r'"searchHash"\s*:\s*"([^"]+)"',
-        r'context=([A-Za-z0-9_\-]+)',
     )
     for pattern in patterns:
         match = re.search(pattern, html)
@@ -249,6 +268,26 @@ def _extract_json_blobs_from_html(html: str) -> list[Any]:
             if parsed is not None:
                 blobs.append(parsed)
     return blobs
+
+
+def _extract_catalog_items_from_state(blob: Any) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    if not isinstance(blob, dict):
+        return items
+    loader = blob.get("loaderData")
+    if not isinstance(loader, dict):
+        return items
+    catalog_block = loader.get("catalog-or-main-or-item")
+    if not isinstance(catalog_block, dict):
+        return items
+    for key in ("items", "catalogItems", "list"):
+        value = catalog_block.get(key)
+        if isinstance(value, list):
+            items.extend(item for item in value if isinstance(item, dict))
+    catalog = catalog_block.get("catalog")
+    if isinstance(catalog, dict) and isinstance(catalog.get("items"), list):
+        items.extend(item for item in catalog["items"] if isinstance(item, dict))
+    return items
 
 
 def _listing_from_raw_item(item: dict[str, Any], config: AppConfig) -> Listing | None:
@@ -412,7 +451,9 @@ def _parse_json_items_from_html(html: str, config: AppConfig) -> list[Listing]:
     seen: set[int] = set()
 
     for blob in _extract_json_blobs_from_html(html):
-        for item in _walk_item_dicts(blob):
+        catalog_items = _extract_catalog_items_from_state(blob)
+        source_items = catalog_items or _walk_item_dicts(blob)
+        for item in source_items:
             listing = _listing_from_raw_item(item, config)
             if listing and listing.avito_id not in seen:
                 seen.add(listing.avito_id)
@@ -545,12 +586,35 @@ class AvitoScraper:
             raise AvitoBlockedError("HTML-страница заблокирована")
         self._search_context = _extract_search_context(html)
         self._catalog_total_count = _extract_total_count_from_html(html)
+        if self._search_context:
+            logger.info("Контекст поиска Авито получен")
+        else:
+            logger.warning("Контекст поиска не найден — API может вернуть нерелевантные объявления")
         if self._catalog_total_count:
             logger.info("На Авито найдено объявлений: %s", self._catalog_total_count)
         return html
 
     def _accept_listing(self, listing: Listing) -> bool:
-        return True
+        return _matches_product(listing.title, self.config.product)
+
+    def _api_items_are_relevant(self, items: list[dict[str, Any]]) -> bool:
+        if not items:
+            return False
+        sample = items[:20]
+        matched = sum(
+            1
+            for item in sample
+            if _matches_product(str(item.get("title") or ""), self.config.product)
+        )
+        ratio = matched / len(sample)
+        logger.info(
+            "Проверка релевантности API: %s/%s объявлений по запросу «%s» (%.0f%%)",
+            matched,
+            len(sample),
+            self.config.product,
+            ratio * 100,
+        )
+        return ratio >= 0.4
 
     def _add_listing(
         self,
@@ -694,89 +758,95 @@ class AvitoScraper:
         listings: list[Listing] = []
         seen_ids: set[int] = set()
         pages_scanned = 0
-        total_found = 0
         source = "html"
-
         bootstrap_html = self._bootstrap_search()
-        first_page_listings = self._parse_page_listings(bootstrap_html)
-        added = self._ingest_page_listings(first_page_listings, listings, seen_ids)
-        if first_page_listings:
-            pages_scanned = 1
+        total_found = self._catalog_total_count or 0
+        max_pages = self._target_page_count(total_found) if total_found else self.config.max_pages
+
+        for page in range(1, max_pages + 1):
+            html = bootstrap_html if page == 1 else self._fetch_html_page(page)
+            page_listings = self._parse_page_listings(html)
+            if not page_listings:
+                logger.info("HTML страница %s: объявлений не найдено", page)
+                if page == 1:
+                    break
+                break
+            added = self._ingest_page_listings(page_listings, listings, seen_ids)
+            pages_scanned += 1
             source = "html"
-            logger.info("HTML/JSON страница 1: найдено %s, добавлено %s", len(first_page_listings), added)
-
-        total_found = self._catalog_total_count or len(listings)
-
-        for fetch_name, fetch_page in (("api", self._fetch_api_page), ("js-api", self._fetch_js_api_page)):
+            logger.info(
+                "HTML страница %s: найдено %s, добавлено %s (релевантных), всего %s",
+                page,
+                len(page_listings),
+                added,
+                len(listings),
+            )
             if total_found and len(listings) >= total_found:
                 break
-            try:
-                api_pages = 0
-                api_total = total_found
-                start_page = 2 if pages_scanned >= 1 else 1
-                for page in range(start_page, self._target_page_count(total_found) + 1):
-                    payload = fetch_page(page)
+            if added == 0:
+                break
+            time.sleep(self.config.request_delay_seconds)
+
+        if self._search_context and (not total_found or len(listings) < total_found):
+            for fetch_name, fetch_page in (("api", self._fetch_api_page), ("js-api", self._fetch_js_api_page)):
+                try:
+                    first_payload = fetch_page(1)
+                    first_items = first_payload.get("items") or []
+                    if not self._api_items_are_relevant(first_items):
+                        logger.warning("%s: объявления не соответствуют запросу, пропускаем", fetch_name)
+                        continue
+
                     api_total = int(
-                        payload.get("totalCount")
-                        or payload.get("foundCount")
-                        or payload.get("count")
-                        or api_total
+                        first_payload.get("totalCount")
+                        or first_payload.get("foundCount")
+                        or first_payload.get("count")
+                        or total_found
                         or 0
-                    )
-                    page_items = payload.get("items") or []
-                    if not page_items:
-                        break
-                    added = self._ingest_api_items(page_items, listings, seen_ids)
-                    api_pages += 1
-                    logger.info(
-                        "%s страница %s: элементов %s, добавлено %s, всего %s",
-                        fetch_name,
-                        page,
-                        len(page_items),
-                        added,
-                        len(listings),
                     )
                     if api_total:
                         total_found = max(total_found, api_total)
-                    if len(page_items) < 50:
-                        break
-                    if total_found and len(listings) >= total_found:
-                        break
-                    time.sleep(self.config.request_delay_seconds)
-                if listings and api_pages:
-                    pages_scanned = max(pages_scanned, api_pages)
-                    source = fetch_name
-                    break
-            except AvitoBlockedError as exc:
-                logger.warning("%s недоступен: %s", fetch_name, exc)
+                        max_pages = self._target_page_count(total_found)
 
-        if total_found and len(listings) < total_found:
-            for page in range(2, self._target_page_count(total_found) + 1):
-                if len(listings) >= total_found:
-                    break
-                try:
-                    html = self._fetch_html_page(page)
-                    page_listings = self._parse_page_listings(html)
-                    if not page_listings:
+                    api_pages = 0
+                    for page in range(1, max_pages + 1):
+                        payload = first_payload if page == 1 else fetch_page(page)
+                        page_items = payload.get("items") or []
+                        if not page_items:
+                            logger.info("%s страница %s: пустой ответ, остановка", fetch_name, page)
+                            break
+                        added = self._ingest_api_items(page_items, listings, seen_ids)
+                        api_pages += 1
+                        logger.info(
+                            "%s страница %s: элементов %s, добавлено %s, всего %s",
+                            fetch_name,
+                            page,
+                            len(page_items),
+                            added,
+                            len(listings),
+                        )
+                        if total_found and len(listings) >= total_found:
+                            break
+                        if added == 0:
+                            logger.info("%s страница %s: новых релевантных объявлений нет", fetch_name, page)
+                            break
+                        time.sleep(self.config.request_delay_seconds)
+
+                    if api_pages:
+                        pages_scanned = max(pages_scanned, api_pages)
+                        source = fetch_name
                         break
-                    added = self._ingest_page_listings(page_listings, listings, seen_ids)
-                    pages_scanned += 1
-                    logger.info("HTML страница %s: найдено %s, добавлено %s", page, len(page_listings), added)
-                    if len(page_listings) < 30:
-                        break
-                    time.sleep(self.config.request_delay_seconds)
-                except AvitoBlockedError:
-                    break
+                except AvitoBlockedError as exc:
+                    logger.warning("%s недоступен: %s", fetch_name, exc)
 
         if not listings:
             for page in range(1, self.config.max_pages + 1):
                 page_items = self._fetch_mobile_page(page)
-                if not page_items:
+                if not page_items or not self._api_items_are_relevant(page_items):
                     break
                 added = self._ingest_api_items(page_items, listings, seen_ids)
                 pages_scanned += 1
                 source = "mobile-api"
-                if added == 0 or len(page_items) < 30:
+                if not added:
                     break
                 time.sleep(self.config.request_delay_seconds)
 

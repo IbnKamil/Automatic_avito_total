@@ -25,6 +25,7 @@ class MarketAnalyzer:
     def analyze(self, scan: ScanResult) -> MarketStats:
         df = self._listings_to_frame(scan.listings)
         priced = df.dropna(subset=["price"]).copy()
+        priced = priced[priced["price"] > 0]
         history = self.storage.get_scan_history(scan.product, scan.region)
 
         percentiles: dict[str, float] = {}
@@ -80,6 +81,7 @@ class MarketAnalyzer:
         output_dir.mkdir(parents=True, exist_ok=True)
         df = self._listings_to_frame(scan.listings)
         priced = df.dropna(subset=["price"]).copy()
+        priced = priced[priced["price"] > 0]
         charts: dict[str, Path] = {}
 
         if not priced.empty:
