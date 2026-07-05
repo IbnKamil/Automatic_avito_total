@@ -24,6 +24,9 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
+# 1.1. Браузер для Авито (обязательно для реального сканирования)
+playwright install chromium
+
 # 2. Настройка
 cp .env.example .env
 # Отредактируйте .env — укажите SMTP и email получателя
@@ -51,6 +54,8 @@ python -m avito_monitor schedule
 | `REPORT_INTERVAL_DAYS` | 3 | Интервал отправки отчётов |
 | `SMTP_*` | — | Настройки почтового сервера |
 | `PROXY` | — | HTTP/SOCKS прокси (рекомендуется) |
+| `USE_BROWSER` | true | Сканирование через Playwright (как в браузере) |
+| `RATE_LIMIT_BACKOFF_SECONDS` | 15 | Пауза при ошибке 429 от Авито |
 
 Определить `location_id` для другого региона:
 
@@ -85,7 +90,18 @@ python -m avito_monitor show-config       # текущие настройки
 
 ## Важно про доступ к Авито
 
-Авито ограничивает доступ с зарубежных IP. Для стабильной работы:
+Авито ограничивает частые HTTP-запросы (ошибка 429) и подгружает объявления через JavaScript.
+
+**Рекомендуется браузерный режим (Playwright):**
+
+```bash
+pip install playwright
+playwright install chromium
+```
+
+В `.env` должно быть `USE_BROWSER=true` (включено по умолчанию).
+
+Дополнительно:
 
 1. Запускайте программу на сервере в России, **или**
 2. Укажите российский прокси в `PROXY=http://user:pass@host:port`

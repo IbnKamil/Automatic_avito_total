@@ -671,13 +671,19 @@ class AvitoScraper:
 
     def _request_with_retry(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         last_error: Exception | None = None
+        backoff = self.config.rate_limit_backoff_seconds
         for attempt in range(3):
             response = self.session.request(method, url, **kwargs)
             if response.status_code not in {429, 503}:
                 return response
             last_error = AvitoBlockedError(response.text)
-            logger.warning("Авито вернул %s, повтор через %s сек.", response.status_code, 2 + attempt)
-            time.sleep(2 + attempt)
+            wait_seconds = backoff * (attempt + 1)
+            logger.warning(
+                "Авито вернул %s, повтор через %s сек.",
+                response.status_code,
+                wait_seconds,
+            )
+            time.sleep(wait_seconds)
         if last_error:
             raise last_error
         raise AvitoBlockedError("Превышено число попыток запроса к Авито")
@@ -704,6 +710,12 @@ class AvitoScraper:
             logger.warning("Контекст поиска не найден — API может вернуть нерелевантные объявления")
         if self._catalog_total_count:
             logger.info("На Авито найдено объявлений: %s", self._catalog_total_count)
+        product_hits = html.lower().count(self.config.product.lower().rstrip("и"))
+        logger.info(
+            "HTML страница поиска: %s символов, упоминаний товара: %s",
+            len(html),
+            product_hits,
+        )
         return html
 
     def _accept_listing(self, listing: Listing) -> bool:
@@ -953,6 +965,7 @@ class AvitoScraper:
 
         need_more = not listings or (total_found and len(listings) < total_found)
         if need_more:
+            time.sleep(max(self.config.request_delay_seconds, 5))
             for fetch_name, fetch_page in (("api", self._fetch_api_page), ("js-api", self._fetch_js_api_page)):
                 try:
                     total_found, api_pages, used_source = self._scan_api_source(
@@ -1016,6 +1029,28 @@ class AvitoScraper:
                 total_found or len(listings),
                 source,
             )
+        elif self.config.use_browser:
+            logger.info("HTTP-сканирование не дало результатов, запускаю браузер Playwright...")
+            try:
+                from avito_monitor.browser_scraper import BrowserScraper
+
+                browser_listings, browser_total, browser_pages = BrowserScraper(
+                    self.config, self._search_url
+                ).scan()
+                if browser_listings:
+                    listings = browser_listings
+                    total_found = browser_total
+                    pages_scanned = browser_pages
+                    source = "browser"
+                    logger.info(
+                        "Браузер: собрано %s из %s объявлений",
+                        len(listings),
+                        total_found,
+                    )
+            except RuntimeError as exc:
+                logger.error("%s", exc)
+            except Exception as exc:
+                logger.warning("Браузерное сканирование не удалось: %s", exc)
         elif last_block_error and not listings:
             raise AvitoScraperError(
                 "Авито заблокировал запросы. Попробуйте позже, запустите с другого интернета "
@@ -1026,8 +1061,11 @@ class AvitoScraper:
         if not listings:
             raise AvitoScraperError(
                 f"Не найдено объявлений «{self.config.product}» в регионе «{self.config.region}». "
-                f"Откройте в браузере и проверьте, что объявления есть: {self._search_url(1)}. "
-                f"Если в браузере они есть, но программа их не видит — пришлите лог запуска."
+                f"Авито ограничивает частые запросы (429). Установите браузерный режим:\n"
+                f"  pip install playwright\n"
+                f"  playwright install chromium\n"
+                f"И убедитесь, что USE_BROWSER=true в .env\n"
+                f"Проверка в браузере: {self._search_url(1)}"
             )
 
         return ScanResult(

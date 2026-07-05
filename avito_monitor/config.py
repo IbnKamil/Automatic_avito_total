@@ -28,6 +28,8 @@ class AppConfig:
     smtp_to: str = ""
     proxy: str = ""
     demo_mode: bool = False
+    use_browser: bool = True
+    rate_limit_backoff_seconds: float = 15.0
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -130,6 +132,10 @@ def load_config(config_path: str | Path = "config.yaml") -> AppConfig:
     config.smtp_to = _clean_credential(os.getenv("SMTP_TO", config.smtp_to))
     config.proxy = os.getenv("PROXY", config.proxy)
     config.demo_mode = _env_bool("DEMO_MODE", config.demo_mode)
+    config.use_browser = _env_bool("USE_BROWSER", config.use_browser)
+    config.rate_limit_backoff_seconds = _env_float(
+        "RATE_LIMIT_BACKOFF_SECONDS", config.rate_limit_backoff_seconds
+    )
     config.database_path = str(resolve_project_path(config.database_path, root))
     config.reports_dir = str(resolve_project_path(config.reports_dir, root))
     return config

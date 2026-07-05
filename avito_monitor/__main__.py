@@ -74,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Интервал отчётов: {config.report_interval_days} дн.")
         print(f"Email: {config.smtp_to or 'не настроен'}")
         print(f"Демо-режим: {config.demo_mode}")
+        print(f"Режим браузера: {config.use_browser}")
         print(f"Папка отчётов: {Path(config.reports_dir).resolve()}")
         print(f"База данных: {Path(config.database_path).resolve()}")
         return 0
