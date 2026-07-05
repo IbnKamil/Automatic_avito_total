@@ -77,10 +77,43 @@ def resolve_location_id(region_name: str) -> tuple[str, int]:
     raise AvitoScraperError(f"Регион не найден на Авито: {region_name}")
 
 
-def _extract_city(location: str) -> str:
-    if not location:
+def _normalize_location(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in (
+            "formattedAddress",
+            "name",
+            "title",
+            "address",
+            "value",
+            "text",
+            "city",
+            "region",
+        ):
+            nested = value.get(key)
+            if nested:
+                if isinstance(nested, str):
+                    return nested.strip()
+                if isinstance(nested, dict):
+                    normalized = _normalize_location(nested)
+                    if normalized:
+                        return normalized
+        string_values = [str(item).strip() for item in value.values() if item]
+        return ", ".join(string_values[:3])
+    if isinstance(value, list):
+        parts = [_normalize_location(item) for item in value]
+        return ", ".join(part for part in parts if part)
+    return str(value).strip()
+
+
+def _extract_city(location: Any) -> str:
+    location_text = _normalize_location(location)
+    if not location_text:
         return "Не указан"
-    parts = [part.strip() for part in location.split(",") if part.strip()]
+    parts = [part.strip() for part in location_text.split(",") if part.strip()]
     if len(parts) >= 2:
         return parts[1]
     return parts[0]
@@ -180,7 +213,7 @@ def _item_from_mobile_payload(item: dict[str, Any], config: AppConfig) -> Listin
         return None
     title = item.get("title") or "Без названия"
     price, price_string = _parse_price(item.get("price") or item.get("priceDetailed"))
-    location = item.get("address") or item.get("location") or ""
+    location = _normalize_location(item.get("address") or item.get("location"))
     url_value = item.get("url") or item.get("uri") or item.get("urlPath") or ""
     if url_value and not str(url_value).startswith("http"):
         url = build_listing_url(str(url_value), int(avito_id), config.region_slug)
@@ -213,11 +246,11 @@ def _item_from_api_payload(item: dict[str, Any], config: AppConfig) -> Listing |
         item.get("priceDetailed") or item.get("price") or item.get("priceValue")
     )
     geo = item.get("geo") or {}
-    location = (
+    location = _normalize_location(
         geo.get("formattedAddress")
+        or geo.get("address")
         or item.get("location")
         or item.get("address")
-        or ""
     )
     url = build_listing_url(item.get("urlPath") or item.get("url"), int(avito_id), config.region_slug)
     images = item.get("images") or []
@@ -539,8 +572,12 @@ class AvitoScraper:
 
             added = 0
             for item in page_items:
-                if self._add_listing(_item_from_api_payload(item, self.config), listings, seen_ids):
-                    added += 1
+                try:
+                    listing = _item_from_api_payload(item, self.config)
+                    if self._add_listing(listing, listings, seen_ids):
+                        added += 1
+                except Exception as exc:
+                    logger.warning("Пропущено объявление из API: %s", exc)
 
             pages_scanned += 1
             if added == 0:
@@ -563,8 +600,12 @@ class AvitoScraper:
 
             added = 0
             for item in page_items:
-                if self._add_listing(_item_from_mobile_payload(item, self.config), listings, seen_ids):
-                    added += 1
+                try:
+                    listing = _item_from_mobile_payload(item, self.config)
+                    if self._add_listing(listing, listings, seen_ids):
+                        added += 1
+                except Exception as exc:
+                    logger.warning("Пропущено объявление из mobile API: %s", exc)
 
             pages_scanned += 1
             if added == 0:
