@@ -56,10 +56,26 @@ def _clean_password(value: str) -> str:
     return _clean_credential(value).replace(" ", "")
 
 
+def find_project_root(start: Path | None = None) -> Path:
+    current = (start or Path.cwd()).resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / "avito_monitor" / "__main__.py").exists():
+            return candidate
+    return current
+
+
+def resolve_project_path(path_value: str, root: Path | None = None) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return (root or find_project_root()) / path
+
+
 def load_config(config_path: str | Path = "config.yaml") -> AppConfig:
     load_dotenv()
+    root = find_project_root()
     config = AppConfig()
-    path = Path(config_path)
+    path = resolve_project_path(str(config_path), root)
     if path.exists():
         with path.open(encoding="utf-8") as handle:
             data = yaml.safe_load(handle) or {}
@@ -114,4 +130,6 @@ def load_config(config_path: str | Path = "config.yaml") -> AppConfig:
     config.smtp_to = _clean_credential(os.getenv("SMTP_TO", config.smtp_to))
     config.proxy = os.getenv("PROXY", config.proxy)
     config.demo_mode = _env_bool("DEMO_MODE", config.demo_mode)
+    config.database_path = str(resolve_project_path(config.database_path, root))
+    config.reports_dir = str(resolve_project_path(config.reports_dir, root))
     return config

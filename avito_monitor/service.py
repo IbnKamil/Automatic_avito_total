@@ -26,6 +26,7 @@ class MonitorService:
         self.reporter = ReportBuilder()
         self.mailer = EmailSender(config)
         self.reports_dir = Path(config.reports_dir)
+        self.reports_dir.mkdir(parents=True, exist_ok=True)
 
     def run_scan_and_report(self, send_email: bool = True) -> Path:
         logger.info(
@@ -66,7 +67,7 @@ class MonitorService:
                     "Email не настроен. Отчёт сохранён локально: %s", report_path
                 )
 
-        logger.info("Сканирование завершено. Отчёт: %s", report_path)
+        logger.info("Сканирование завершено. Отчёт: %s", report_path.resolve())
         return report_path
 
     def start_scheduler(self) -> None:

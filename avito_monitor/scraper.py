@@ -397,8 +397,7 @@ class AvitoScraper:
         raise AvitoBlockedError("Превышено число попыток запроса к Авито")
 
     def _accept_listing(self, listing: Listing) -> bool:
-        if not _matches_product(listing.title, self.config.product):
-            return False
+        # Поиск уже выполнен по запросу product в регионе region на Авито.
         return _matches_region(
             listing,
             self.config.region_slug,
@@ -505,6 +504,13 @@ class AvitoScraper:
                 if self._add_listing(listing, listings, seen_ids):
                     added += 1
 
+            if page_listings and not added:
+                logger.warning(
+                    "Страница %s: Авито вернул %s объявлений, но ни одно не прошло фильтр региона",
+                    page,
+                    len(page_listings),
+                )
+
             pages_scanned += 1
             total_found = max(total_found, len(listings))
             if added == 0:
@@ -598,6 +604,11 @@ class AvitoScraper:
         ):
             try:
                 listings, total_found, pages_scanned = scanner()
+                logger.info(
+                    "Способ %s: собрано %s объявлений",
+                    method_name,
+                    len(listings),
+                )
                 if listings:
                     source = method_name
                     break

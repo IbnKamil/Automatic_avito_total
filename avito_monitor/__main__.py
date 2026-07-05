@@ -4,8 +4,10 @@ import argparse
 import logging
 import sys
 
+from pathlib import Path
+
 from avito_monitor.config import load_config
-from avito_monitor.scraper import resolve_location_id
+from avito_monitor.scraper import AvitoScraperError, resolve_location_id
 from avito_monitor.mailer import EmailSender
 from avito_monitor.service import MonitorService
 
@@ -72,6 +74,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Интервал отчётов: {config.report_interval_days} дн.")
         print(f"Email: {config.smtp_to or 'не настроен'}")
         print(f"Демо-режим: {config.demo_mode}")
+        print(f"Папка отчётов: {Path(config.reports_dir).resolve()}")
+        print(f"База данных: {Path(config.database_path).resolve()}")
         return 0
 
     if args.command == "test-email":
@@ -83,7 +87,12 @@ def main(argv: list[str] | None = None) -> int:
     service = MonitorService(config)
 
     if args.command == "scan":
-        service.run_scan_and_report(send_email=not args.no_email)
+        try:
+            report_path = service.run_scan_and_report(send_email=not args.no_email)
+        except AvitoScraperError as exc:
+            print(f"\nОшибка сканирования: {exc}\n")
+            return 1
+        print(f"\nГотово. Отчёт сохранён в:\n{report_path.resolve()}\n")
         return 0
 
     if args.command == "schedule":
