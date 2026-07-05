@@ -6,6 +6,7 @@ import sys
 
 from avito_monitor.config import load_config
 from avito_monitor.scraper import resolve_location_id
+from avito_monitor.mailer import EmailSender
 from avito_monitor.service import MonitorService
 
 
@@ -30,6 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     config_parser = subparsers.add_parser("show-config", help="Показать текущую конфигурацию")
     config_parser.add_argument("--product", help="Товар для поиска")
     config_parser.add_argument("--region", help="Регион поиска")
+
+    subparsers.add_parser("test-email", help="Проверить настройки SMTP тестовым письмом")
 
     return parser
 
@@ -69,6 +72,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Интервал отчётов: {config.report_interval_days} дн.")
         print(f"Email: {config.smtp_to or 'не настроен'}")
         print(f"Демо-режим: {config.demo_mode}")
+        return 0
+
+    if args.command == "test-email":
+        mailer = EmailSender(config)
+        mailer.send_test_email()
+        print(f"Тестовое письмо отправлено на {config.smtp_to}")
         return 0
 
     service = MonitorService(config)

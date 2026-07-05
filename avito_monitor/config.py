@@ -47,6 +47,15 @@ def _env_float(name: str, default: float) -> float:
     return float(value) if value else default
 
 
+def _clean_credential(value: str) -> str:
+    cleaned = value.strip().strip('"').strip("'")
+    return cleaned
+
+
+def _clean_password(value: str) -> str:
+    return _clean_credential(value).replace(" ", "")
+
+
 def load_config(config_path: str | Path = "config.yaml") -> AppConfig:
     load_dotenv()
     config = AppConfig()
@@ -93,10 +102,16 @@ def load_config(config_path: str | Path = "config.yaml") -> AppConfig:
     config.smtp_host = os.getenv("SMTP_HOST", config.smtp_host)
     config.smtp_port = _env_int("SMTP_PORT", config.smtp_port)
     config.smtp_use_tls = _env_bool("SMTP_USE_TLS", config.smtp_use_tls)
-    config.smtp_username = os.getenv("SMTP_USERNAME", config.smtp_username)
-    config.smtp_password = os.getenv("SMTP_PASSWORD", config.smtp_password)
-    config.smtp_from = os.getenv("SMTP_FROM", config.smtp_from or config.smtp_username)
-    config.smtp_to = os.getenv("SMTP_TO", config.smtp_to)
+    config.smtp_username = _clean_credential(
+        os.getenv("SMTP_USERNAME", config.smtp_username)
+    )
+    config.smtp_password = _clean_password(
+        os.getenv("SMTP_PASSWORD", config.smtp_password)
+    )
+    config.smtp_from = _clean_credential(
+        os.getenv("SMTP_FROM", config.smtp_from or config.smtp_username)
+    )
+    config.smtp_to = _clean_credential(os.getenv("SMTP_TO", config.smtp_to))
     config.proxy = os.getenv("PROXY", config.proxy)
     config.demo_mode = _env_bool("DEMO_MODE", config.demo_mode)
     return config
