@@ -34,6 +34,7 @@ class AppConfig:
     browser_profile_dir: str = "data/browser_profile"
     export_pdf: bool = True
     browser_max_empty_pages: int = 3
+    browser_captcha_wait_seconds: int = 180
     rate_limit_backoff_seconds: float = 15.0
 
 
@@ -144,6 +145,9 @@ def load_config(config_path: str | Path = "config.yaml") -> AppConfig:
     config.export_pdf = _env_bool("EXPORT_PDF", config.export_pdf)
     config.browser_max_empty_pages = _env_int(
         "BROWSER_MAX_EMPTY_PAGES", config.browser_max_empty_pages
+    )
+    config.browser_captcha_wait_seconds = _env_int(
+        "BROWSER_CAPTCHA_WAIT_SECONDS", config.browser_captcha_wait_seconds
     )
     config.rate_limit_backoff_seconds = _env_float(
         "RATE_LIMIT_BACKOFF_SECONDS", config.rate_limit_backoff_seconds

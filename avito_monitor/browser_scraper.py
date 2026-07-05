@@ -27,12 +27,20 @@ _BLOCK_MARKERS = (
     "подтвердите, что вы не робот",
     "checkpoint-captcha",
     'data-marker="captcha"',
+    "hcaptcha.com",
+    "captcha-container",
 )
 
 _API_URL_MARKERS = (
     "/web/1/js/items",
     "/web/1/main/items",
     "/api/9/items",
+)
+
+_ITEM_SELECTORS = (
+    '[data-marker="item"]',
+    '[data-marker="catalog-serp"] [data-marker="item"]',
+    "article[data-item-id]",
 )
 
 _STEALTH_SCRIPT = """
@@ -57,7 +65,7 @@ class BrowserScraper:
 
     def scan(self) -> tuple[list[Listing], int, int]:
         try:
-            from playwright.sync_api import sync_playwright
+            from playwright.sync_api import sync_playwright  # noqa: F401
         except ImportError as exc:
             raise RuntimeError(
                 "Для режима браузера установите Playwright:\n"
@@ -65,8 +73,10 @@ class BrowserScraper:
                 "  python -m playwright install chromium"
             ) from exc
 
-        listings, total_found, pages_scanned, blocked = self._run(headless=self.config.browser_headless)
-        if not listings and self.config.browser_headless:
+        if self.config.browser_headless:
+            listings, total_found, pages_scanned, blocked = self._run(headless=True)
+            if listings:
+                return listings, total_found, pages_scanned
             logger.info(
                 "Скрытый браузер не нашёл объявления — пробую видимое окно "
                 "(можно пройти капчу вручную)..."
@@ -77,6 +87,11 @@ class BrowserScraper:
             if visible_listings:
                 return visible_listings, visible_total, visible_pages
             blocked = blocked or visible_blocked
+            listings = visible_listings
+            total_found = visible_total
+            pages_scanned = visible_pages
+        else:
+            listings, total_found, pages_scanned, blocked = self._run(headless=False)
 
         if blocked and not listings:
             logger.error(
@@ -139,6 +154,7 @@ class BrowserScraper:
                     api_payloads.append(body)
 
             page.on("response", on_response)
+            warmed_up = False
 
             for page_num in range(1, max_pages + 1):
                 api_payloads.clear()
@@ -146,31 +162,26 @@ class BrowserScraper:
                 mode = "скрытый" if headless else "видимый"
                 logger.info("Браузер (%s): страница %s — %s", mode, page_num, url)
 
-                html = ""
-                for attempt in range(2):
-                    try:
-                        page.goto(url, wait_until="domcontentloaded", timeout=90000)
-                        self._wait_for_content(page)
-                        html = page.content()
-                        break
-                    except PlaywrightTimeoutError as exc:
-                        if attempt == 0:
-                            logger.warning(
-                                "Браузер: таймаут страницы %s, повтор через 5 сек...",
-                                page_num,
-                            )
-                            page.wait_for_timeout(5000)
-                            continue
-                        logger.warning(
-                            "Браузер: таймаут загрузки страницы %s: %s", page_num, exc
-                        )
-                        html = page.content()
+                html = self._load_page(page, url, warmed_up=warmed_up)
+                warmed_up = True
 
                 if _is_browser_page_blocked(html):
                     blocked = True
-                    self._save_debug(page, html, page_num, "blocked")
-                    logger.error("Браузер: страница заблокирована (капча / 429)")
-                    break
+                    if not headless and page_num == 1:
+                        logger.warning(
+                            "Браузер: обнаружена капча или блокировка — "
+                            "пройдите проверку в окне Chrome"
+                        )
+                        if self._wait_for_listings(page, headless=False):
+                            html = page.content()
+                            blocked = False
+                        else:
+                            self._save_debug(page, html, page_num, "blocked")
+                            break
+                    else:
+                        self._save_debug(page, html, page_num, "blocked")
+                        logger.error("Браузер: страница заблокирована (капча / 429)")
+                        break
 
                 if page_num == 1:
                     avito_total = _extract_total_count_from_html(html) or 0
@@ -182,32 +193,35 @@ class BrowserScraper:
                     if api_total:
                         avito_total = max(avito_total, api_total)
 
-                page_listings = self._collect_page_listings(page, html, api_payloads)
-                card_count = page.locator('[data-marker="item"]').count()
-                added = 0
-                skipped_seen = 0
-                skipped_filter = 0
-                for listing in page_listings:
-                    if listing.avito_id in seen_ids:
-                        skipped_seen += 1
-                        continue
-                    if not listing.title or not _matches_product(listing.title, self.config.product):
-                        skipped_filter += 1
-                        continue
-                    seen_ids.add(listing.avito_id)
-                    listings.append(listing)
-                    added += 1
+                page_listings, card_count, added, skipped_seen, skipped_filter = (
+                    self._ingest_page_listings(page, html, api_payloads, listings, seen_ids)
+                )
 
-                if added == 0 and page_num == 1:
+                if added == 0 and page_num == 1 and card_count == 0:
                     self._save_debug(page, html, page_num, "empty")
-                    logger.warning(
-                        "Браузер: на странице 1 нет релевантных объявлений "
-                        "(карточек в DOM: %s, ответов API: %s)",
-                        card_count,
-                        len(api_payloads),
-                    )
+                    if not headless and self._wait_for_listings(page, headless=False):
+                        html = page.content()
+                        blocked = False
+                        page_listings, card_count, added, skipped_seen, skipped_filter = (
+                            self._ingest_page_listings(
+                                page, html, api_payloads, listings, seen_ids
+                            )
+                        )
+                    else:
+                        logger.warning(
+                            "Браузер: на странице 1 нет объявлений "
+                            "(карточек в DOM: %s, ответов API: %s)",
+                            card_count,
+                            len(api_payloads),
+                        )
+                        if page_num == 1 and card_count == 0:
+                            blocked = True
+                            break
 
-                if not page_listings and card_count == 0:
+                if card_count == 0 and not page_listings:
+                    if page_num == 1:
+                        blocked = blocked or headless
+                        break
                     logger.info("Браузер: страница %s пуста — конец выдачи", page_num)
                     break
 
@@ -250,26 +264,107 @@ class BrowserScraper:
         reported_total = max(avito_total, len(listings))
         return listings, reported_total, pages_scanned, blocked
 
+    def _load_page(self, page, url: str, warmed_up: bool) -> str:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        if not warmed_up:
+            try:
+                page.goto(AVITO_BASE, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(2000)
+            except PlaywrightTimeoutError:
+                logger.debug("Браузер: не удалось открыть главную Авито")
+
+        for attempt in range(2):
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=90000)
+                self._wait_for_content(page)
+                return page.content()
+            except PlaywrightTimeoutError as exc:
+                if attempt == 0:
+                    logger.warning(
+                        "Браузер: таймаут загрузки, повтор через 5 сек..."
+                    )
+                    page.wait_for_timeout(5000)
+                    continue
+                logger.warning("Браузер: таймаут загрузки страницы: %s", exc)
+                return page.content()
+        return page.content()
+
+    def _item_count(self, page) -> int:
+        for selector in _ITEM_SELECTORS:
+            count = page.locator(selector).count()
+            if count:
+                return count
+        return 0
+
+    def _wait_for_listings(self, page, headless: bool) -> bool:
+        if headless:
+            return False
+
+        timeout_sec = self.config.browser_captcha_wait_seconds
+        logger.info(
+            "Браузер: ожидание загрузки объявлений до %s сек. "
+            "Если видите капчу — пройдите её в окне Chrome.",
+            timeout_sec,
+        )
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if self._item_count(page) > 0:
+                logger.info("Браузер: объявления загрузились, продолжаю сканирование")
+                self._wait_for_content(page)
+                return True
+            remaining = int(deadline - time.time())
+            if remaining > 0 and remaining % 30 == 0:
+                logger.info("Браузер: жду... осталось ~%s сек", remaining)
+            page.wait_for_timeout(3000)
+            self._scroll_page(page)
+
+        return self._item_count(page) > 0
+
+    def _ingest_page_listings(
+        self,
+        page,
+        html: str,
+        api_payloads: list[dict[str, Any]],
+        listings: list[Listing],
+        seen_ids: set[int],
+    ) -> tuple[list[Listing], int, int, int, int]:
+        page_listings = self._collect_page_listings(page, html, api_payloads)
+        card_count = self._item_count(page)
+        added = 0
+        skipped_seen = 0
+        skipped_filter = 0
+        for listing in page_listings:
+            if listing.avito_id in seen_ids:
+                skipped_seen += 1
+                continue
+            if not listing.title or not _matches_product(listing.title, self.config.product):
+                skipped_filter += 1
+                continue
+            seen_ids.add(listing.avito_id)
+            listings.append(listing)
+            added += 1
+        return page_listings, card_count, added, skipped_seen, skipped_filter
+
+    def _scroll_page(self, page) -> None:
+        page.evaluate("window.scrollBy(0, Math.max(500, window.innerHeight * 0.8))")
+        page.wait_for_timeout(800)
+
     def _wait_for_content(self, page) -> None:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
         try:
-            page.wait_for_load_state("networkidle", timeout=25000)
+            page.wait_for_load_state("networkidle", timeout=30000)
         except PlaywrightTimeoutError:
             pass
-        for selector in (
-            '[data-marker="item"]',
-            '[data-marker="catalog-serp"]',
-            "article[data-item-id]",
-        ):
+        for selector in _ITEM_SELECTORS:
             try:
-                page.wait_for_selector(selector, timeout=12000)
+                page.wait_for_selector(selector, timeout=15000)
                 break
             except PlaywrightTimeoutError:
                 continue
-        for _ in range(3):
-            page.evaluate("window.scrollBy(0, Math.max(500, window.innerHeight * 0.8))")
-            page.wait_for_timeout(1200)
+        for _ in range(4):
+            self._scroll_page(page)
 
     def _collect_page_listings(
         self,
